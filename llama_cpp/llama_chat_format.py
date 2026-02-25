@@ -2914,6 +2914,230 @@ while also answering every question accurately, clearly, and step-by-step when a
 
             return bitmap
 
+    def extract_hidden_states(
+        self,
+        llama: "llama.Llama",
+        messages: List[llama_types.ChatCompletionRequestMessage],
+        layer: str = "penultimate",   # "penultimate" | "final"
+        include: str = "text",        # "text" | "image" | "all"
+    ) -> "np.ndarray":
+        """Extract hidden states from a multimodal prompt for use as diffusion
+        model conditioning (Lumina-2 / zimage-turbo style).
+
+        Runs a full forward pass of the text + image through all transformer layers
+        via the mmproj pipeline, then returns the per-token hidden states from the
+        requested layer — without generating any output tokens.
+
+        The model must have been loaded with:
+            embeddings=True
+            pooling_type=LLAMA_POOLING_TYPE_NONE
+
+        Args:
+            llama:    The Llama model instance.
+            messages: Chat messages in OpenAI format, may include image_url content.
+            layer:    Which layer's output to return:
+                        "penultimate" — second-to-last block output (pre-final-norm).
+                                        Required for Lumina-2/zimage-turbo conditioning.
+                        "final"       — final block output after all layers + norm.
+            include:  Which token positions to include in the output:
+                        "text"  — only text token positions (default, face-conditioned
+                                  by cross-attention with image tokens during forward pass)
+                        "image" — only image/vision token positions
+                        "all"   — all token positions (text + image interleaved)
+
+        Returns:
+            np.ndarray of shape [n_selected_tokens, n_embd] float32.
+            For Qwen3-VL-4B this is [n_tokens, 2560].
+
+        Raises:
+            RuntimeError: If the model was not loaded with embeddings=True /
+                          POOLING_TYPE_NONE, or if penultimate layer is requested
+                          but not supported by the model's graph builder.
+            ValueError:   If mtmd tokenization or decode fails.
+        """
+        import numpy as np
+
+        # ── Initialize mtmd context ──────────────────────────────────────
+        self._init_mtmd_context(llama)
+        assert self.mtmd_ctx is not None
+
+        # ── Validate context flags ───────────────────────────────────────
+        if not llama.context_params.embeddings:
+            raise RuntimeError(
+                "extract_hidden_states() requires the model to be loaded with "
+                "embeddings=True and pooling_type=LLAMA_POOLING_TYPE_NONE."
+            )
+
+        # ── Build prompt with image markers ──────────────────────────────
+        system_prompt = _get_system_message(messages)
+        if system_prompt == "" and self.DEFAULT_SYSTEM_MESSAGE is not None:
+            messages = [
+                llama_types.ChatCompletionRequestSystemMessage(
+                    role="system", content=self.DEFAULT_SYSTEM_MESSAGE
+                )
+            ] + messages
+
+        image_urls = self.get_image_urls(messages)
+        media_marker = self._mtmd_cpp.mtmd_default_marker().decode("utf-8")
+
+        text = self.chat_template.render(
+            messages=messages,
+            tools=None,
+            add_generation_prompt=False,
+            eos_token=llama.detokenize([llama.token_eos()]),
+            bos_token=llama.detokenize([llama.token_bos()]),
+            **self.extra_template_arguments,
+        )
+        for image_url in image_urls:
+            text = text.replace(image_url, media_marker)
+
+        if self.verbose:
+            print(f"[extract_hidden_states] prompt: {text}", file=sys.stderr)
+
+        # ── Create bitmaps ───────────────────────────────────────────────
+        bitmaps = []
+        bitmap_cleanup = []
+        try:
+            for image_url in image_urls:
+                image_bytes = self.load_image(image_url)
+                bitmap = self._create_bitmap_from_bytes(image_bytes)
+                bitmaps.append(bitmap)
+                bitmap_cleanup.append(bitmap)
+
+            # ── Tokenize text + images together ──────────────────────────
+            input_text = self._mtmd_cpp.mtmd_input_text()
+            input_text.text = text.encode("utf-8")
+            input_text.add_special = True
+            input_text.parse_special = True
+
+            bitmap_array = (self._mtmd_cpp.mtmd_bitmap_p_ctypes * len(bitmaps))(*bitmaps)
+            chunks = self._mtmd_cpp.mtmd_input_chunks_init()
+            if chunks is None:
+                raise ValueError("Failed to create mtmd input chunks")
+
+            try:
+                ret = self._mtmd_cpp.mtmd_tokenize(
+                    self.mtmd_ctx, chunks,
+                    ctypes.byref(input_text), bitmap_array, len(bitmaps),
+                )
+                if ret != 0:
+                    raise ValueError(f"mtmd_tokenize failed: {ret}")
+
+                # ── Reset context ─────────────────────────────────────────
+                llama.reset()
+                llama._ctx.memory_clear(True)
+
+                # ── Walk chunks, track text vs image positions, decode ────
+                text_positions = []
+                image_positions = []
+                n_past = 0
+                n_chunks = self._mtmd_cpp.mtmd_input_chunks_size(chunks)
+
+                for i in range(n_chunks):
+                    chunk = self._mtmd_cpp.mtmd_input_chunks_get(chunks, i)
+                    if chunk is None:
+                        continue
+                    ctype = self._mtmd_cpp.mtmd_input_chunk_get_type(chunk)
+
+                    if ctype == self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_TEXT:
+                        n_tok_out = ctypes.c_size_t(0)
+                        tok_ptr = self._mtmd_cpp.mtmd_input_chunk_get_tokens_text(
+                            chunk, ctypes.byref(n_tok_out)
+                        )
+                        if tok_ptr and n_tok_out.value > 0:
+                            tokens = [tok_ptr[j] for j in range(n_tok_out.value)]
+                            start = n_past
+
+                            # Build batch with ALL logits flags set so every
+                            # token position has its embedding stored
+                            batch = llama_cpp.llama_batch_init(len(tokens), 0, 1)
+                            for k, tok in enumerate(tokens):
+                                batch.token[k] = tok
+                                batch.pos[k] = n_past + k
+                                batch.n_seq_id[k] = 1
+                                batch.seq_id[k][0] = 0
+                                batch.logits[k] = 1  # mark ALL as output
+                            batch.n_tokens = len(tokens)
+
+                            ret = llama_cpp.llama_decode(llama._ctx.ctx, batch)
+                            llama_cpp.llama_batch_free(batch)
+                            if ret != 0:
+                                raise ValueError(f"llama_decode failed: {ret}")
+
+                            text_positions.extend(range(start, start + len(tokens)))
+                            n_past += len(tokens)
+                            llama.n_tokens = n_past
+
+                    else:  # IMAGE or AUDIO
+                        new_n_past = llama_cpp.llama_pos(0)
+                        ret = self._mtmd_cpp.mtmd_helper_eval_chunk_single(
+                            self.mtmd_ctx, llama._ctx.ctx, chunk,
+                            llama_cpp.llama_pos(n_past),
+                            llama_cpp.llama_seq_id(0),
+                            llama.n_batch,
+                            False,  # logits_last
+                            ctypes.byref(new_n_past),
+                        )
+                        if ret != 0:
+                            raise ValueError(f"mtmd_helper_eval_chunk_single failed: {ret}")
+
+                        image_positions.extend(range(n_past, new_n_past.value))
+                        n_past = new_n_past.value
+                        llama.n_tokens = n_past
+
+                # ── Select which positions to return ──────────────────────
+                if include == "text":
+                    positions = text_positions
+                elif include == "image":
+                    positions = image_positions
+                else:
+                    positions = sorted(text_positions + image_positions)
+
+                if not positions:
+                    raise ValueError(
+                        "No token positions selected — check 'include' parameter"
+                    )
+
+                # ── Read back hidden states ───────────────────────────────
+                n_embd = llama.n_embd()
+                results = []
+
+                for tok_idx in positions:
+                    if layer == "penultimate":
+                        ptr = llama_cpp.llama_get_embeddings_penultimate_ith(
+                            llama._ctx.ctx, ctypes.c_int32(tok_idx)
+                        )
+                    else:  # "final"
+                        ptr = llama_cpp.llama_get_embeddings_ith(
+                            llama._ctx.ctx, ctypes.c_int32(tok_idx)
+                        )
+
+                    if ptr is None:
+                        if layer == "penultimate":
+                            raise RuntimeError(
+                                f"llama_get_embeddings_penultimate_ith returned NULL "
+                                f"for token {tok_idx}. Ensure the model's graph "
+                                f"builder populates t_embd_penultimate (requires "
+                                f"patched qwen3vl.cpp / qwen3.cpp)."
+                            )
+                        raise RuntimeError(
+                            f"llama_get_embeddings_ith returned NULL for token "
+                            f"{tok_idx}. Ensure embeddings=True and "
+                            f"LLAMA_POOLING_TYPE_NONE."
+                        )
+
+                    vec = np.ctypeslib.as_array(ptr, shape=(n_embd,)).copy()
+                    results.append(vec)
+
+                return np.stack(results, axis=0)  # [n_selected_tokens, n_embd]
+
+            finally:
+                self._mtmd_cpp.mtmd_input_chunks_free(chunks)
+
+        finally:
+            for bitmap in bitmap_cleanup:
+                self._mtmd_cpp.mtmd_bitmap_free(bitmap)
+
     def __call__(
         self,
         *,
