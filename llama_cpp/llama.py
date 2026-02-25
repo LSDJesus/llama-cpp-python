@@ -1571,6 +1571,63 @@ class Llama:
             },
         }
 
+    def get_penultimate_embeddings(
+        self,
+        token_positions: Optional[List[int]] = None,
+    ) -> Optional[np.ndarray]:
+        """Extract penultimate-layer hidden states (pre-final-block residual stream).
+
+        These are the raw hidden states from the second-to-last transformer block,
+        before the final layer norm and LM head projection. This is the correct
+        conditioning signal for diffusion models that use LLM hidden states directly
+        (e.g. Lumina-2 style, zimage-turbo) as they were trained against this
+        representation, not the final post-norm output.
+
+        Requires:
+            - embeddings=True set at model construction time
+            - LLAMA_POOLING_TYPE_NONE
+            - A model whose graph builder populates t_embd_penultimate
+              (currently: Qwen3, Qwen3-VL via patched qwen3.cpp / qwen3vl.cpp)
+            - At least one llama_decode() call has been made
+
+        Args:
+            token_positions: List of token indices to retrieve. If None, returns
+                             all tokens that have valid penultimate embeddings.
+                             Negative indices supported (-1 = last token).
+
+        Returns:
+            np.ndarray of shape [n_positions, n_embd] float32, or None if
+            penultimate embeddings are not available for this model/context.
+        """
+        n_embd = self.n_embd()
+        n_tokens = self.n_tokens
+
+        if n_tokens == 0:
+            return None
+
+        if token_positions is None:
+            token_positions = list(range(n_tokens))
+
+        results = []
+        for i in token_positions:
+            # Resolve negative indices
+            if i < 0:
+                i = n_tokens + i
+            if i < 0 or i >= n_tokens:
+                raise IndexError(f"Token position {i} out of range [0, {n_tokens})")
+
+            ptr = llama_cpp.llama_get_embeddings_penultimate_ith(
+                self._ctx.ctx, ctypes.c_int32(i)
+            )
+            if ptr is None:
+                return None  # Model doesn't support penultimate embeddings
+            results.append(np.ctypeslib.as_array(ptr, shape=(n_embd,)).copy())
+
+        if not results:
+            return None
+
+        return np.stack(results, axis=0)  # [n_positions, n_embd]
+
     def embed(
         self,
         input: Union[str, List[str]],

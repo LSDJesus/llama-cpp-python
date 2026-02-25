@@ -752,6 +752,9 @@ class LlamaContext:
     def get_embeddings_seq(self, seq_id: int):
         return llama_cpp.llama_get_embeddings_seq(self.ctx, seq_id)
 
+    def get_embeddings_penultimate_ith(self, i: int):
+        return llama_cpp.llama_get_embeddings_penultimate_ith(self.ctx, i)
+
     def reset_timings(self):
         llama_cpp.llama_perf_context_reset(self.ctx)
 

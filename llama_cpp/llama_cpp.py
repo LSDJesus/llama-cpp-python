@@ -3205,6 +3205,25 @@ def llama_get_embeddings_seq(
     ...
 
 
+# // [Luna] Get penultimate layer (pre-norm) embeddings for the ith token.
+# // Returns the hidden state BEFORE the final RMSNorm, matching HuggingFace hidden_states[-2].
+# // shape: [n_embd] (1-dimensional)
+# // Returns NULL if not available.
+# LLAMA_API float * llama_get_embeddings_penultimate_ith(struct llama_context * ctx, int32_t i);
+@ctypes_function(
+    "llama_get_embeddings_penultimate_ith",
+    [llama_context_p_ctypes, ctypes.c_int32],
+    ctypes.POINTER(ctypes.c_float),
+)
+def llama_get_embeddings_penultimate_ith(
+    ctx: llama_context_p, i: Union[ctypes.c_int32, int], /
+) -> CtypesArray[ctypes.c_float]:
+    """Get the penultimate layer (pre-norm) embeddings for the ith token.
+    Matches HuggingFace hidden_states[-2].
+    shape: [n_embd] (1-dimensional)"""
+    ...
+
+
 # //
 # // backend sampling API [EXPERIMENTAL]
 # // note: use only if the llama_context was created with at least one llama_sampler_seq_config
