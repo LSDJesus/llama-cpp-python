@@ -755,6 +755,28 @@ class LlamaContext:
     def get_embeddings_penultimate_ith(self, i: int):
         return llama_cpp.llama_get_embeddings_penultimate_ith(self.ctx, i)
 
+    def get_embeddings_layer_ith(self, layer: int, i: int):
+        return llama_cpp.llama_get_embeddings_layer_ith(self.ctx, layer, i)
+
+    def set_layer_capture(self, mask):
+        """Set which layers to capture. mask: list of bool, or None to disable."""
+        if mask is None:
+            llama_cpp.llama_set_layer_capture(self.ctx, None, 0)
+        else:
+            c_mask = (ctypes.c_bool * len(mask))(*mask)
+            llama_cpp.llama_set_layer_capture(self.ctx, c_mask, len(mask))
+
+    def set_layer_skip(self, mask):
+        """Set which layers to skip. mask: list of bool, or None to disable."""
+        if mask is None:
+            llama_cpp.llama_set_layer_skip(self.ctx, None, 0)
+        else:
+            c_mask = (ctypes.c_bool * len(mask))(*mask)
+            llama_cpp.llama_set_layer_skip(self.ctx, c_mask, len(mask))
+
+    def get_n_layer(self) -> int:
+        return llama_cpp.llama_get_n_layer(self.ctx)
+
     def reset_timings(self):
         llama_cpp.llama_perf_context_reset(self.ctx)
 

@@ -167,6 +167,7 @@ cover/
 dmypy.json
 .pyre/
 .pytype/
+*.json
 
 # Cython debug symbols
 cython_debug/
