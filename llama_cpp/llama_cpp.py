@@ -3072,6 +3072,82 @@ def llama_get_embeddings_penultimate_ith(
     ...
 
 
+# // [Luna] Get hidden state from a specific transformer layer for the ith token.
+# // Requires llama_set_layer_capture() to have been called with the layer enabled.
+# // shape: [n_embd] (1-dimensional)
+# // Returns NULL if the layer was not captured or embeddings are not enabled.
+# LLAMA_API float * llama_get_embeddings_layer_ith(struct llama_context * ctx, int32_t layer, int32_t i);
+@ctypes_function(
+    "llama_get_embeddings_layer_ith",
+    [llama_context_p_ctypes, ctypes.c_int32, ctypes.c_int32],
+    ctypes.POINTER(ctypes.c_float),
+)
+def llama_get_embeddings_layer_ith(
+    ctx: llama_context_p,
+    layer: Union[ctypes.c_int32, int],
+    i: Union[ctypes.c_int32, int],
+    /,
+) -> CtypesArray[ctypes.c_float]:
+    """Get hidden state from a specific transformer layer for the ith token.
+    Requires llama_set_layer_capture() to have been called with the layer enabled.
+    shape: [n_embd] (1-dimensional)"""
+    ...
+
+
+# // [Luna] Set which layers to capture hidden states from during inference.
+# // mask: boolean array of length n_layers (true = capture this layer's output).
+# // Pass NULL to disable all layer capture.
+# LLAMA_API void llama_set_layer_capture(struct llama_context * ctx, const bool * mask, int32_t n_layers);
+@ctypes_function(
+    "llama_set_layer_capture",
+    [llama_context_p_ctypes, ctypes.POINTER(ctypes.c_bool), ctypes.c_int32],
+    None,
+)
+def llama_set_layer_capture(
+    ctx: llama_context_p,
+    mask: CtypesPointerOrRef[ctypes.c_bool],
+    n_layers: Union[ctypes.c_int32, int],
+    /,
+) -> None:
+    """Set which layers to capture hidden states from.
+    Pass None/NULL to disable all layer capture."""
+    ...
+
+
+# // [Luna] Set which layers to skip during inference.
+# // mask: boolean array of length n_layers (true = skip this layer).
+# // Pass NULL to disable all layer skipping.
+# LLAMA_API void llama_set_layer_skip(struct llama_context * ctx, const bool * mask, int32_t n_layers);
+@ctypes_function(
+    "llama_set_layer_skip",
+    [llama_context_p_ctypes, ctypes.POINTER(ctypes.c_bool), ctypes.c_int32],
+    None,
+)
+def llama_set_layer_skip(
+    ctx: llama_context_p,
+    mask: CtypesPointerOrRef[ctypes.c_bool],
+    n_layers: Union[ctypes.c_int32, int],
+    /,
+) -> None:
+    """Set which layers to skip during inference.
+    Pass None/NULL to disable all layer skipping."""
+    ...
+
+
+# // [Luna] Get the number of transformer layers in the model.
+# LLAMA_API int32_t llama_get_n_layer(struct llama_context * ctx);
+@ctypes_function(
+    "llama_get_n_layer",
+    [llama_context_p_ctypes],
+    ctypes.c_int32,
+)
+def llama_get_n_layer(
+    ctx: llama_context_p, /
+) -> int:
+    """Get the number of transformer layers in the model."""
+    ...
+
+
 # //
 # // backend sampling API [EXPERIMENTAL]
 # // note: use only if the llama_context was created with at least one llama_sampler_seq_config

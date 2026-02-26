@@ -1247,7 +1247,7 @@ class Llama:
             ptr = llama_cpp.llama_get_embeddings_penultimate_ith(
                 self._ctx.ctx, ctypes.c_int32(i)
             )
-            if ptr is None:
+            if not ptr:
                 return None  # Model doesn't support penultimate embeddings
             results.append(np.ctypeslib.as_array(ptr, shape=(n_embd,)).copy())
 
@@ -1255,6 +1255,100 @@ class Llama:
             return None
 
         return np.stack(results, axis=0)  # [n_positions, n_embd]
+
+    def get_n_layer(self) -> int:
+        """Get the number of transformer layers in the model."""
+        return self._ctx.get_n_layer()
+
+    def set_layer_capture(self, layers: Optional[List[int]] = None) -> None:
+        """Enable per-layer hidden state capture for specified layers.
+
+        Args:
+            layers: List of layer indices (0-based) to capture, or None to
+                    disable all capture. Use get_n_layer() to find total layers.
+        """
+        if layers is None:
+            self._ctx.set_layer_capture(None)
+        else:
+            n_layer = self.get_n_layer()
+            mask = [i in layers for i in range(n_layer)]
+            self._ctx.set_layer_capture(mask)
+
+    def set_layer_skip(self, layers: Optional[List[int]] = None) -> None:
+        """Set layers to skip during inference (layer pruning).
+
+        Skipped layers pass the hidden state through unchanged — no attention,
+        no FFN. Useful for layer redundancy analysis and inference speedup.
+
+        Args:
+            layers: List of layer indices (0-based) to skip, or None to
+                    disable all skipping.
+        """
+        if layers is None:
+            self._ctx.set_layer_skip(None)
+        else:
+            n_layer = self.get_n_layer()
+            mask = [i in layers for i in range(n_layer)]
+            self._ctx.set_layer_skip(mask)
+
+    def get_layer_embeddings(
+        self,
+        layers: Optional[List[int]] = None,
+        token_positions: Optional[List[int]] = None,
+    ) -> Optional[Dict[int, np.ndarray]]:
+        """Extract hidden states from specific transformer layers.
+
+        Requires set_layer_capture() to have been called with the target layers
+        before the decode/encode call, and embeddings=True at model construction.
+
+        Args:
+            layers: List of layer indices to retrieve. If None, returns all
+                    captured layers.
+            token_positions: List of token indices. If None, returns all tokens.
+                             Negative indices supported (-1 = last token).
+
+        Returns:
+            Dict mapping layer index -> np.ndarray of shape [n_positions, n_embd],
+            or None if no layer embeddings are available.
+        """
+        n_embd = self.n_embd()
+        n_tokens = self.n_tokens
+        n_layer = self.get_n_layer()
+
+        if n_tokens == 0:
+            return None
+
+        if token_positions is None:
+            token_positions = list(range(n_tokens))
+
+        if layers is None:
+            layers = list(range(n_layer))
+
+        result: Dict[int, np.ndarray] = {}
+
+        for il in layers:
+            if il < 0 or il >= n_layer:
+                continue
+
+            layer_results = []
+            for i in token_positions:
+                pos = i
+                if pos < 0:
+                    pos = n_tokens + pos
+                if pos < 0 or pos >= n_tokens:
+                    raise IndexError(f"Token position {i} out of range [0, {n_tokens})")
+
+                ptr = llama_cpp.llama_get_embeddings_layer_ith(
+                    self._ctx.ctx, ctypes.c_int32(il), ctypes.c_int32(pos)
+                )
+                if not ptr:
+                    continue  # This layer wasn't captured (NULL pointer)
+                layer_results.append(np.ctypeslib.as_array(ptr, shape=(n_embd,)).copy())
+
+            if layer_results:
+                result[il] = np.stack(layer_results, axis=0)
+
+        return result if result else None
 
     def embed(
         self,
