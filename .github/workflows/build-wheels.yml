@@ -1,0 +1,184 @@
+################################################################################
+# Build CUDA Wheels — llama-cpp-python (Luna fork)
+#
+# Produces 2 ABI3 wheels with CUDA 12.8 + native SASS for RTX 2000-5000:
+#   - cp39-abi3-win_amd64                 (Windows)
+#   - cp39-abi3-manylinux_2_28_x86_64    (Linux)
+#
+# Each wheel works on Python 3.9-3.14. No PyTorch dependency.
+#
+# CUDA arch targets (native SASS, no JIT):
+#   sm_75  = RTX 2000 series (Turing)
+#   sm_86  = RTX 3000 series (Ampere)
+#   sm_89  = RTX 4000 series (Ada Lovelace)
+#   sm_120 = RTX 5000 series (Blackwell) — requires CUDA 12.8+
+#
+# The last entry (120) includes PTX for forward-compat with future GPUs.
+# All others use -real (SASS only) to minimize binary size.
+#
+# Trigger: push a tag like v0.3.27-luna.1, or run manually.
+################################################################################
+name: Build CUDA Wheels
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Create a GitHub release with the built wheels'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  # sm_75=Turing, sm_86=Ampere, sm_89=Ada, sm_120=Blackwell
+  # -real = SASS only.  Last entry without -real emits PTX for future GPUs.
+  CUDAARCHS: "75-real;86-real;89-real;120"
+
+jobs:
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  Windows — CUDA 12.8 wheel                                            ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  build-windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Jimver/cuda-toolkit installs NVCC, cuBLAS, cuDNN headers etc.
+      # Docs: https://github.com/Jimver/cuda-toolkit
+      - name: Install CUDA 12.8 Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda-toolkit
+        with:
+          cuda: '12.8.0'
+          method: network
+
+      - name: Verify CUDA
+        run: nvcc --version
+
+      - name: Build wheel
+        env:
+          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
+          CMAKE_BUILD_PARALLEL_LEVEL: "4"
+        run: pip wheel . -w dist --verbose
+
+      - name: Show built wheel
+        run: |
+          Get-ChildItem dist\*.whl | ForEach-Object {
+            Write-Host "$($_.Name)  ($([math]::Round($_.Length / 1MB, 1)) MB)"
+          }
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows-cuda
+          path: dist/*.whl
+          retention-days: 30
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  Linux — CUDA 12.8 wheel (manylinux_2_28)                             ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  build-linux-cuda:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    # manylinux_2_28 is AlmaLinux 8 (glibc 2.28) — covers Ubuntu 20.04+,
+    # Debian 10+, RHEL 8+, Fedora 29+.  All Python versions at /opt/python/.
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+
+    steps:
+      # Install CUDA 12.8 from NVIDIA's RPM repo into the manylinux container.
+      # Only the toolkit (compiler + headers + libs) — no driver needed for building.
+      - name: Install CUDA 12.8 Toolkit
+        run: |
+          dnf install -y yum-utils
+          dnf config-manager --add-repo \
+            https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+          dnf install -y --setopt=install_weak_deps=False \
+            cuda-toolkit-12-8
+          echo "/usr/local/cuda-12.8/bin" >> $GITHUB_PATH
+
+      - name: Verify CUDA
+        run: /usr/local/cuda-12.8/bin/nvcc --version
+
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build wheel
+        env:
+          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
+          CMAKE_BUILD_PARALLEL_LEVEL: "4"
+          LD_LIBRARY_PATH: "/usr/local/cuda-12.8/lib64"
+        run: |
+          /opt/python/cp311-cp311/bin/python -m pip wheel . -w raw_dist --verbose
+
+      # auditwheel bundles non-system shared libs and re-tags as manylinux.
+      # We EXCLUDE CUDA runtime libs — users provide those via their driver.
+      - name: Repair wheel (manylinux_2_28 tag)
+        run: |
+          /opt/python/cp311-cp311/bin/python -m pip install auditwheel patchelf
+          /opt/python/cp311-cp311/bin/auditwheel repair raw_dist/*.whl -w dist \
+            --exclude libcuda.so.1 \
+            --exclude libcudart.so.12 \
+            --exclude libcublas.so.12 \
+            --exclude libcublasLt.so.12 \
+            --exclude libnvidia-ml.so.1 \
+            --exclude libnvJitLink.so.12 \
+            --plat manylinux_2_28_x86_64
+
+      - name: Show built wheel
+        run: ls -lh dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-cuda
+          path: dist/*.whl
+          retention-days: 30
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  Create GitHub Release with wheels                                     ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  release:
+    needs: [build-windows-cuda, build-linux-cuda]
+    runs-on: ubuntu-latest
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          merge-multiple: true
+
+      - name: List wheels
+        run: ls -lh wheels/
+
+      # softprops/action-gh-release creates a release with the wheels attached.
+      # For tag pushes, the tag name is used automatically.
+      # For manual dispatch, we generate a tag from the short SHA.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wheels/*.whl
+          generate_release_notes: true
+          # On manual dispatch without a tag, this creates a draft release
+          draft: ${{ !startsWith(github.ref, 'refs/tags/v') }}
