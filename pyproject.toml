@@ -64,6 +64,7 @@ all = [
 
 [tool.scikit-build]
 wheel.packages = ["llama_cpp"]
+wheel.py-api = "cp39"   # ABI3: one wheel per platform, works on Python 3.9+
 cmake.verbose = true
 cmake.minimum-version = "3.21"
 minimum-version = "0.5.1"
