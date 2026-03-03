@@ -44,7 +44,7 @@ jobs:
   # ╚══════════════════════════════════════════════════════════════════════════╝
   build-windows-cuda:
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - name: Checkout with submodules
@@ -69,15 +69,18 @@ jobs:
       - name: Verify CUDA
         run: nvcc --version
 
+      - name: Install build deps
+        run: pip install "scikit-build-core[pyproject]>=0.9.2" numpy typing-extensions diskcache jinja2 Pillow
+
       - name: Build wheel
         env:
           CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
-        run: pip wheel . -w dist --verbose
+        run: pip wheel . -w dist --no-deps --verbose
 
       - name: Show built wheel
         run: |
-          Get-ChildItem dist\*.whl | ForEach-Object {
+          Get-ChildItem dist\llama_cpp_python-*.whl | ForEach-Object {
             Write-Host "$($_.Name)  ($([math]::Round($_.Length / 1MB, 1)) MB)"
           }
 
@@ -93,7 +96,7 @@ jobs:
   # ╚══════════════════════════════════════════════════════════════════════════╝
   build-linux-cuda:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     # manylinux_2_28 is AlmaLinux 8 (glibc 2.28) — covers Ubuntu 20.04+,
     # Debian 10+, RHEL 8+, Fedora 29+.  All Python versions at /opt/python/.
@@ -120,20 +123,26 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install build deps
+        run: |
+          /opt/python/cp311-cp311/bin/python -m pip install \
+            "scikit-build-core[pyproject]>=0.9.2" numpy typing-extensions \
+            diskcache jinja2 Pillow
+
       - name: Build wheel
         env:
           CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
           LD_LIBRARY_PATH: "/usr/local/cuda-12.8/lib64"
         run: |
-          /opt/python/cp311-cp311/bin/python -m pip wheel . -w raw_dist --verbose
+          /opt/python/cp311-cp311/bin/python -m pip wheel . -w raw_dist --no-deps --verbose
 
       # auditwheel bundles non-system shared libs and re-tags as manylinux.
       # We EXCLUDE CUDA runtime libs — users provide those via their driver.
       - name: Repair wheel (manylinux_2_28 tag)
         run: |
           /opt/python/cp311-cp311/bin/python -m pip install auditwheel patchelf
-          /opt/python/cp311-cp311/bin/auditwheel repair raw_dist/*.whl -w dist \
+          /opt/python/cp311-cp311/bin/auditwheel repair raw_dist/llama_cpp_python-*.whl -w dist \
             --exclude libcuda.so.1 \
             --exclude libcudart.so.12 \
             --exclude libcublas.so.12 \
