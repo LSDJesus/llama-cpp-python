@@ -180,13 +180,27 @@ jobs:
       - name: List wheels
         run: ls -lh wheels/
 
-      # softprops/action-gh-release creates a release with the wheels attached.
-      # For tag pushes, the tag name is used automatically.
-      # For manual dispatch, we generate a tag from the short SHA.
+      # Extract version from wheel filename for tag generation.
+      # Wheel format: llama_cpp_python-{version}-{pytag}-{abi}-{plat}.whl
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "is_draft=false" >> $GITHUB_OUTPUT
+          else
+            # Extract version from first wheel filename
+            whl=$(ls wheels/*.whl | head -1)
+            ver=$(basename "$whl" | sed 's/llama_cpp_python-\([^-]*\)-.*/\1/')
+            short_sha=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "tag_name=v${ver}-cuda-${short_sha}" >> $GITHUB_OUTPUT
+            echo "is_draft=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
           files: wheels/*.whl
           generate_release_notes: true
-          # On manual dispatch without a tag, this creates a draft release
-          draft: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          draft: ${{ steps.tag.outputs.is_draft == 'true' }}
