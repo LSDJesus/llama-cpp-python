@@ -1,0 +1,260 @@
+From: Brian <brian@luna.dev>
+Subject: [PATCH] Add penultimate layer hidden state extraction API
+
+Add llama_get_embeddings_penultimate_ith() — retrieves the hidden state
+from the second-to-last transformer block (before final RMSNorm),
+equivalent to HuggingFace's hidden_states[-2].
+
+Motivation: Diffusion model text encoders (Lumina-2, Flux-style
+architectures) are trained against pre-norm penultimate layer outputs,
+not the post-norm final embeddings that llama_get_embeddings_ith()
+returns. Without this API, anyone using llama.cpp as a text encoder
+for image generation gets the wrong representation.
+
+The implementation follows the same pattern as the existing embeddings
+API: buffer allocation, GPU->CPU async copy, output reordering, and a
+per-token getter function. Model builders opt-in by storing the residual
+stream into res->t_embd_penultimate before the final norm — currently
+implemented for Qwen3 and Qwen3-VL, trivially extensible to other
+architectures.
+
+Changes:
+  include/llama.h          - API declaration
+  src/llama-graph.h        - t_embd_penultimate tensor + getter
+  src/llama-graph.cpp      - reset() + set_outputs()
+  src/llama-context.h      - buffer_view + method declaration
+  src/llama-context.cpp    - buffer alloc, GPU copy, getter, reorder, C API
+  src/models/qwen3.cpp     - capture point before final norm
+  src/models/qwen3vl.cpp   - capture point before final norm
+
+---
+diff --git a/include/llama.h b/include/llama.h
+index 1234567..abcdefg 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -990,6 +990,13 @@ extern "C" {
+     // returns NULL for invalid ids.
+     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+ 
++    // Get the penultimate layer (pre-norm) embeddings for the ith token.
++    // Returns the hidden state BEFORE the final RMSNorm/LayerNorm, matching
++    // HuggingFace hidden_states[-2]. Required for diffusion model conditioning
++    // where the text encoder was trained against pre-norm representations.
++    // shape: [n_embd] (1-dimensional)
++    // Returns NULL if the model does not provide penultimate embeddings or embeddings are not enabled.
++    LLAMA_API float * llama_get_embeddings_penultimate_ith(struct llama_context * ctx, int32_t i);
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 1234567..abcdefg 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -640,6 +640,7 @@ public:
+     ggml_tensor * get_embd()             const { return t_embd; }
+     ggml_tensor * get_embd_pooled()      const { return t_embd_pooled; }
++    ggml_tensor * get_embd_penultimate() const { return t_embd_penultimate; }
+ 
+     ggml_cgraph  * get_gf()  const { return gf; }
+     ggml_context * get_ctx() const { return ctx_compute.get(); }
+@@ -667,6 +668,7 @@ public:
+     ggml_tensor * t_embd              = nullptr;
+     ggml_tensor * t_embd_pooled       = nullptr;
++    ggml_tensor * t_embd_penultimate  = nullptr; // pre-norm penultimate layer output
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1234567..abcdefg 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -733,6 +733,7 @@ void llm_graph_result::reset() {
+     t_embd        = nullptr;
+     t_embd_pooled = nullptr;
++    t_embd_penultimate = nullptr;
+     t_sampled.clear();
+ 
+@@ -773,6 +774,9 @@ void llm_graph_result::set_outputs() {
+     if (t_embd != nullptr) {
+         ggml_set_output(t_embd);
+     }
++    if (t_embd_penultimate != nullptr) {
++        ggml_set_output(t_embd_penultimate);
++    }
+     if (t_embd_pooled != nullptr) {
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 1234567..abcdefg 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -79,6 +79,7 @@ public:
+     float * get_embeddings_ith(int32_t i);
+     float * get_embeddings_seq(llama_seq_id seq_id);
++    float * get_embeddings_penultimate_ith(int32_t i);
+ 
+@@ -280,6 +281,9 @@ private:
+     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
+     buffer_view<float> embd = {nullptr, 0};
+ 
++    // penultimate layer embeddings (pre-norm, matches HF hidden_states[-2])
++    // populated only when embeddings == true and model provides t_embd_penultimate
++    buffer_view<float> embd_penultimate = {nullptr, 0};
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1234567..abcdefg 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+
+ ## 1. Add getter method (after get_embeddings_seq)
+
+@@ -770,6 +770,26 @@ float * llama_context::get_embeddings_seq(...) {
+     return it->second.data();
+ }
+ 
++float * llama_context::get_embeddings_penultimate_ith(int32_t i) {
++    output_reorder();
++
++    try {
++        if (embd_penultimate.data == nullptr) {
++            throw std::runtime_error("no penultimate embeddings");
++        }
++
++        const int64_t j = output_resolve_row(i);
++        const uint32_t n_embd_dim = model.hparams.n_embd;
++        return embd_penultimate.data + j*n_embd_dim;
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: invalid penultimate embeddings id %d, reason: %s\n", __func__, i, err.what());
++#ifndef NDEBUG
++        GGML_ABORT("fatal error");
++#else
++        return nullptr;
++#endif
++    }
++}
++
+ ## 2. Extract penultimate embeddings in encode path (after the embedding pooling switch block)
+
+     // ... end of pooling switch statement ...
+     }
++
++    // extract penultimate layer embeddings (pre-norm hidden states)
++    {
++        auto * t_embd_pen = res->get_embd_penultimate();
++        if (embd_penultimate.data && t_embd_pen) {
++            ggml_backend_t backend_pen = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd_pen);
++            GGML_ASSERT(backend_pen != nullptr);
++            GGML_ASSERT(embd_penultimate.data != nullptr);
++            const uint32_t n_embd_dim = hparams.n_embd;
++            GGML_ASSERT(n_tokens*n_embd_dim <= (int64_t) embd_penultimate.size);
++            ggml_backend_tensor_get_async(backend_pen, t_embd_pen, embd_penultimate.data, 0, n_tokens*n_embd_dim*sizeof(float));
++        }
++    }
+ 
+ ## 3. Extract penultimate embeddings in batched decode path (after the embedding pooling switch block)
+
+     // ... end of pooling switch statement ...
+     }
++
++    // extract penultimate layer embeddings (batched decode path)
++    {
++        auto * t_embd_pen = res->get_embd_penultimate();
++        if (embd_penultimate.data && t_embd_pen && n_outputs > 0) {
++            ggml_backend_t backend_pen = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd_pen);
++            GGML_ASSERT(backend_pen != nullptr);
++            const uint32_t n_embd_dim = hparams.n_embd;
++            float * pen_out = embd_penultimate.data + n_outputs_prev*n_embd_dim;
++            if (n_outputs) {
++                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
++                GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_dim <= (int64_t) embd_penultimate.size);
++                ggml_backend_tensor_get_async(backend_pen, t_embd_pen, pen_out, 0, n_outputs*n_embd_dim*sizeof(float));
++            }
++        }
++    }
+ 
+ ## 4. Buffer sizing (in output_reserve, after embd.size = ...)
+
+     logits.size = has_logits ? n_vocab*n_outputs_max : 0;
+     embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
++    embd_penultimate.size = has_embd ? hparams.n_embd*n_outputs_max : 0;
+ 
+ ## 5. Total size calculation (add embd_penultimate.size to the sum)
+
+-    const size_t new_size  =
+-        (logits.size + embd.size + backend_float_count) * sizeof(float) +
++    const size_t new_size  =
++        (logits.size + embd.size + embd_penultimate.size + backend_float_count) * sizeof(float) +
+ 
+ ## 6. Null pointers on buffer realloc (after embd.data = nullptr)
+
+             logits.data = nullptr;
+             embd.data = nullptr;
++            embd_penultimate.data = nullptr;
+ 
+ ## 7. Buffer layout assignment (after embd offset)
+
+     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
+     offset += embd.size * sizeof(float);
+ 
++    // penultimate layer buffer (hidden_states[-2])
++    embd_penultimate = has_embd ? buffer_view<float>{(float *) (base + offset), embd_penultimate.size} : buffer_view<float>{nullptr, 0};
++    offset += embd_penultimate.size * sizeof(float);
++
+ ## 8. Output reorder (after embd reorder block)
+
+         if (embd.size > 0) {
+             for (uint64_t k = 0; k < n_embd; k++) {
+                 std::swap(embd.data[i0*n_embd + k], embd.data[i1*n_embd + k]);
+             }
+         }
++
++        if (embd_penultimate.size > 0) {
++            for (uint64_t k = 0; k < n_embd; k++) {
++                std::swap(embd_penultimate.data[i0*n_embd + k], embd_penultimate.data[i1*n_embd + k]);
++            }
++        }
+ 
+ ## 9. C API export (after llama_get_embeddings_seq)
+
+ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+     ctx->synchronize();
+     return ctx->get_embeddings_seq(seq_id);
+ }
++
++float * llama_get_embeddings_penultimate_ith(llama_context * ctx, int32_t i) {
++    ctx->synchronize();
++    return ctx->get_embeddings_penultimate_ith(i);
++}
+ 
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index 1234567..abcdefg 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -115,6 +115,13 @@ llm_build_qwen3::llm_build_qwen3(...) {
+     }
+     cur = inpL;
+ 
++    // Store pre-norm residual stream as penultimate layer output.
++    // Matches HuggingFace hidden_states[-2] for diffusion model conditioning.
++    if (cparams.embeddings) {
++        res->t_embd_penultimate = cur;
++        cb(res->t_embd_penultimate, "result_penultimate", -1);
++    }
++
+     cur = build_norm(cur,
+             model.output_norm, NULL,
+             LLM_NORM_RMS, -1);
+ 
+diff --git a/src/models/qwen3vl.cpp b/src/models/qwen3vl.cpp
+index 1234567..abcdefg 100644
+--- a/src/models/qwen3vl.cpp
++++ b/src/models/qwen3vl.cpp
+@@ -130,6 +130,13 @@ llm_build_qwen3vl::llm_build_qwen3vl(...) {
+     }
+     cur = inpL;
+ 
++    // Store pre-norm residual stream as penultimate layer output.
++    // Matches HuggingFace hidden_states[-2] for diffusion model conditioning.
++    if (cparams.embeddings) {
++        res->t_embd_penultimate = cur;
++        cb(res->t_embd_penultimate, "result_penultimate", -1);
++    }
++
+     cur = build_norm(cur,
+             model.output_norm, NULL,
+             LLM_NORM_RMS, -1);
