@@ -80,6 +80,7 @@ class Llama:
         check_tensors: bool = False,
         use_extra_bufts: bool = False,
         no_host: bool = False,
+        skip_output_head: bool = False,
         kv_overrides: Optional[Dict[str, Union[bool, int, float, str]]] = None,
         # Context Params
         seed: int = llama_cpp.LLAMA_DEFAULT_SEED,
@@ -171,6 +172,7 @@ class Llama:
             check_tensors: validate model tensor data
             use_extra_bufts: use extra buffer types (used for weight repacking)
             no_host: bypass host buffer allowing extra buffers to be used
+            skip_output_head: [Luna] skip loading output.weight (lm_head) to save VRAM in embedding-only mode
             kv_overrides: Key-value overrides for the model.
             seed: RNG seed, -1 for random
             n_ctx: Text context, 0 = from model
@@ -268,6 +270,7 @@ class Llama:
         self.model_params.check_tensors = check_tensors
         self.model_params.use_extra_bufts = use_extra_bufts
         self.model_params.no_host = no_host
+        self.model_params.skip_output_head = skip_output_head
 
         # kv_overrides is the original python dict
         self.kv_overrides = kv_overrides
@@ -2587,6 +2590,7 @@ prompt: The prompt to generate text from.
             check_tensors=self.model_params.check_tensors,
             use_extra_bufts=self.model_params.use_extra_bufts,
             no_host=self.model_params.no_host,
+            skip_output_head=self.model_params.skip_output_head,
             kv_overrides=self.kv_overrides,
             # Context Params
             seed=self._seed,
