@@ -74,7 +74,7 @@ jobs:
 
       - name: Build wheel
         env:
-          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
+          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDAARCHS }}"
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
         run: pip wheel . -w dist --no-deps --verbose
 
@@ -131,7 +131,7 @@ jobs:
 
       - name: Build wheel
         env:
-          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
+          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDAARCHS }}"
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
           LD_LIBRARY_PATH: "/usr/local/cuda-12.8/lib64"
         run: |
