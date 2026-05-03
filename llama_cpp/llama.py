@@ -1671,13 +1671,19 @@ class Llama:
         self,
         token_positions: Optional[List[int]] = None,
     ) -> Optional[np.ndarray]:
-        """Extract penultimate-layer hidden states (pre-final-block residual stream).
+        """Extract the residual stream after the final transformer block, before the final RMS norm.
 
-        These are the raw hidden states from the second-to-last transformer block,
-        before the final layer norm and LM head projection. This is the correct
-        conditioning signal for diffusion models that use LLM hidden states directly
-        (e.g. Lumina-2 style, zimage-turbo) as they were trained against this
-        representation, not the final post-norm output.
+        In HuggingFace transformers convention this is hidden_states[-2]:
+          - hidden_states[-1] = last_hidden_state (post final RMS norm, before lm_head)
+          - hidden_states[-2] = output of the last transformer block (attn + FFN + residual),
+                                 BEFORE the final RMS normalization
+
+        Note: this is NOT the output of the second-to-last transformer block. It is the
+        output of the LAST block (block n_layer-1), captured before build_norm() is applied.
+        In Qwen3/llama.cpp terms: cur after the transformer loop exits, before output_norm.
+
+        This is the correct conditioning signal for diffusion models trained on LLM hidden
+        states directly (e.g. Lumina-2, Z-Image) which use hidden_states[-2] as input.
 
         Requires:
             - embeddings=True set at model construction time
