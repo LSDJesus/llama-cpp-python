@@ -60,7 +60,7 @@ jobs:
       # Jimver/cuda-toolkit installs NVCC, cuBLAS, cuDNN headers etc.
       # Docs: https://github.com/Jimver/cuda-toolkit
       - name: Install CUDA 12.8 Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: '12.8.0'
@@ -171,6 +171,9 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:
