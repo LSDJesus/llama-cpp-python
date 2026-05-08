@@ -3326,7 +3326,8 @@ while also answering every question accurately, clearly, and step-by-step when a
                 )
             ] + messages
 
-        image_urls = self.get_image_urls(messages)
+        media_items = self._get_media_items(messages)
+        image_urls = [item["url"] for item in media_items if item["type"] == "image"]
         media_marker = self._mtmd_cpp.mtmd_default_marker().decode("utf-8")
 
         text = self.chat_template.render(
@@ -3348,7 +3349,7 @@ while also answering every question accurately, clearly, and step-by-step when a
         bitmap_cleanup = []
         try:
             for image_url in image_urls:
-                image_bytes = self.load_image(image_url)
+                image_bytes = self.load_media(image_url, "image")
                 bitmap = self._create_bitmap_from_bytes(image_bytes)
                 bitmaps.append(bitmap)
                 bitmap_cleanup.append(bitmap)
@@ -3359,16 +3360,22 @@ while also answering every question accurately, clearly, and step-by-step when a
             input_text.add_special = True
             input_text.parse_special = True
 
-            bitmap_array = (self._mtmd_cpp.mtmd_bitmap_p_ctypes * len(bitmaps))(*bitmaps)
             chunks = self._mtmd_cpp.mtmd_input_chunks_init()
             if chunks is None:
                 raise ValueError("Failed to create mtmd input chunks")
 
             try:
-                ret = self._mtmd_cpp.mtmd_tokenize(
-                    self.mtmd_ctx, chunks,
-                    ctypes.byref(input_text), bitmap_array, len(bitmaps),
-                )
+                if len(bitmaps) > 0:
+                    bitmap_array = (self._mtmd_cpp.mtmd_bitmap_p_ctypes * len(bitmaps))(*bitmaps)
+                    ret = self._mtmd_cpp.mtmd_tokenize(
+                        self.mtmd_ctx, chunks,
+                        ctypes.byref(input_text), bitmap_array, len(bitmaps),
+                    )
+                else:
+                    ret = self._mtmd_cpp.mtmd_tokenize(
+                        self.mtmd_ctx, chunks,
+                        ctypes.byref(input_text), None, 0,
+                    )
                 if ret != 0:
                     raise ValueError(f"mtmd_tokenize failed: {ret}")
 

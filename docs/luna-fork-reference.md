@@ -251,3 +251,77 @@ output_norm(cur)          ← t_embd = cur              (hidden_states[-1] / las
   ↓
 lm_head(cur)              ← t_logits                  (logits)
 ```
+
+---
+
+## Hidden State Shapes, dtypes, and Multimodal Conventions (Qwen3.5-VL-4B)
+
+### Q1 — Penultimate extractor output shape and dtype
+
+`get_penultimate_embeddings()` always returns an **unpooled, per-token** tensor:
+
+```
+dtype:  float32
+shape:  [seq_len, hidden_dim]   ← variable seq_len, never pre-pooled
+```
+
+`hidden_dim` for Qwen3.5-VL-4B = **2560** (confirmed: `qwen35.embedding_length = 2560` in GGUF).
+
+This matches `clip.vision.projection_dim = 2560` in the mmproj — both the text backbone
+and the visual projector operate in the same embedding space.
+
+Pooling, if desired, must be applied downstream (mean, last-token, CLS, etc.).
+The `token_positions` argument is a selection helper, not pooling — it just slices specific
+rows from the `[seq_len, 2560]` tensor before returning.
+
+---
+
+### Q2 — Combined text + image input: one sequence or two tensors?
+
+**One flat sequence, one combined tensor.** This is the standard Qwen-VL convention and
+nothing in this fork changes it.
+
+The pipeline:
+
+1. Raw image pixels → ViT → `qwen3vl_merger` projector → 576 projected vectors of dim 2560
+2. Those 576 vectors are substituted in-place for the `<image_pad>` (token ID 151655) positions
+   in the flat token sequence, bookended by `<vision_start>` (151652) and `<vision_end>` (151653)
+3. `llama_decode()` processes the combined sequence as a single batch
+4. `get_penultimate_embeddings()` returns **one tensor** covering every position:
+
+```
+positions: [text_prefix...] [vision_start] [image_pad × 576] [vision_end] [text_suffix...]
+shape:      [total_seq_len, 2560]   ← single tensor, no separation
+```
+
+**Identifying image vs text positions** requires no inference from the hidden-state values;
+the original input token IDs provide a deterministic binary mask:
+
+```python
+# image_mask[i] == True  → position i is an image patch token
+image_mask = (input_ids == 151655)   # <image_pad>
+```
+
+The boundary tokens (`vision_start`, `vision_end`) are themselves text-side control tokens
+and their hidden states mix modalities at the seam — exclude them if you want clean
+image-only or text-only slices.
+
+---
+
+### Q3 — mmproj output: token count and dim for a single image
+
+Derivation from GGUF metadata (`Qwen3.5-4B-heretic.mmproj-Q8_0.gguf`):
+
+| Stage | Calculation | Result |
+|---|---|---|
+| Input resolution | `clip.vision.image_size = 768` | 768 × 768 px |
+| ViT patch size | `clip.vision.patch_size = 16` | 16 × 16 px |
+| Raw patch grid | 768 / 16 = 48 per side | 48 × 48 = **2304 patches** |
+| Spatial merge | `clip.vision.spatial_merge_size = 2` → 2×2 merge | 2304 / 4 = **576 tokens** |
+| Token dim | `clip.vision.projection_dim = 2560` | **2560** |
+
+**mmproj output for one image: 576 tokens × 2560 dim.**
+
+This is the exact block that gets spliced into the main sequence at the `<image_pad>` positions.
+At lower input resolutions the patch count (and therefore token count) scales down proportionally;
+768 px is the native/maximum tile size for this model variant.
