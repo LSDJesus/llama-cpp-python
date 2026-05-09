@@ -3185,6 +3185,48 @@ def llama_get_embeddings_penultimate_ith(
     ...
 
 
+# [Luna] Accumulating penultimate buffer API.
+# Because output_reserve() resizes the per-call buffer on every llama_decode() call,
+# penultimate embeddings from earlier calls are overwritten. The accum API provides
+# a persistent buffer that survives across calls.
+#
+# LLAMA_API void    llama_flush_penultimate_accum(struct llama_context * ctx);
+@ctypes_function(
+    "llama_flush_penultimate_accum",
+    [llama_context_p_ctypes],
+    None,
+)
+def llama_flush_penultimate_accum(ctx: llama_context_p, /) -> None:
+    """Flush the last decode call's penultimate data into the accumulation buffer.
+    Call this ONCE after the final llama_decode in a sequence."""
+    ...
+
+
+# LLAMA_API void    llama_reset_penultimate_accum(struct llama_context * ctx);
+@ctypes_function(
+    "llama_reset_penultimate_accum",
+    [llama_context_p_ctypes],
+    None,
+)
+def llama_reset_penultimate_accum(ctx: llama_context_p, /) -> None:
+    """Reset the accumulation buffer. Call before starting a new decode session."""
+    ...
+
+
+# LLAMA_API float * llama_get_embeddings_penultimate_accum_ith(struct llama_context * ctx, int32_t i);
+@ctypes_function(
+    "llama_get_embeddings_penultimate_accum_ith",
+    [llama_context_p_ctypes, ctypes.c_int32],
+    ctypes.POINTER(ctypes.c_float),
+)
+def llama_get_embeddings_penultimate_accum_ith(
+    ctx: llama_context_p, i: Union[ctypes.c_int32, int], /
+) -> CtypesArray[ctypes.c_float]:
+    """Return the i-th slot from the accumulated penultimate buffer.
+    Returns NULL if i is out of range."""
+    ...
+
+
 # // [Luna] Get hidden state from a specific transformer layer for the ith token.
 # // Requires llama_set_layer_capture() to have been called with the layer enabled.
 # // shape: [n_embd] (1-dimensional)

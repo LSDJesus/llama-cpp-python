@@ -3317,180 +3317,119 @@ while also answering every question accurately, clearly, and step-by-step when a
                 "embeddings=True and pooling_type=LLAMA_POOLING_TYPE_NONE."
             )
 
-        # ── Build prompt with image markers ──────────────────────────────
-        system_prompt = _get_system_message(messages)
-        if system_prompt == "" and self.DEFAULT_SYSTEM_MESSAGE is not None:
-            messages = [
-                llama_types.ChatCompletionRequestSystemMessage(
-                    role="system", content=self.DEFAULT_SYSTEM_MESSAGE
-                )
-            ] + messages
+        # ── Tokenize via the same pipeline as __call__ ───────────────────
+        # _process_mtmd_prompt handles media loading, template rendering,
+        # mtmd_tokenize, and virtual-token ledger construction correctly.
+        full_prompt_ids, chunk_token_spans, chunks, bitmap_cleanup = \
+            self._process_mtmd_prompt(
+                llama=llama,
+                messages=messages,
+                add_generation_prompt=False,
+            )
 
-        media_items = self._get_media_items(messages)
-        image_urls = [item["url"] for item in media_items if item["type"] == "image"]
-        media_marker = self._mtmd_cpp.mtmd_default_marker().decode("utf-8")
-
-        text = self.chat_template.render(
-            messages=messages,
-            tools=None,
-            add_generation_prompt=False,
-            eos_token=llama.detokenize([llama.token_eos()]),
-            bos_token=llama.detokenize([llama.token_bos()]),
-            **self.extra_template_arguments,
-        )
-        for image_url in image_urls:
-            text = text.replace(image_url, media_marker)
-
-        if self.verbose:
-            print(f"[extract_hidden_states] prompt: {text}", file=sys.stderr)
-
-        # ── Create bitmaps ───────────────────────────────────────────────
-        bitmaps = []
-        bitmap_cleanup = []
         try:
-            for image_url in image_urls:
-                image_bytes = self.load_media(image_url, "image")
-                bitmap = self._create_bitmap_from_bytes(image_bytes)
-                bitmaps.append(bitmap)
-                bitmap_cleanup.append(bitmap)
+            # ── Reset KV cache and accum buffer ───────────────────────────
+            llama.reset()
+            llama._ctx.memory_clear(True)
+            llama.n_tokens = 0
+            llama_cpp_lib.llama_reset_penultimate_accum(llama._ctx.ctx)
 
-            # ── Tokenize text + images together ──────────────────────────
-            input_text = self._mtmd_cpp.mtmd_input_text()
-            input_text.text = text.encode("utf-8")
-            input_text.add_special = True
-            input_text.parse_special = True
+            # ── Walk chunks, decode ───────────────────────────────────────
+            # output_reserve() automatically flushes each call's penultimate
+            # data into the accum buffer before reallocating for the next call.
+            # We just need to call llama_flush_penultimate_accum() after the
+            # FINAL decode to capture its data too.
+            n_embd = llama.n_embd()
+            text_slot_ranges: List[tuple] = []   # (start, end) in accum buffer
+            image_slots: List[int] = []           # single accum slot per image
+            n_accum = 0  # tracks next accum slot (= total outputs decoded so far)
 
-            chunks = self._mtmd_cpp.mtmd_input_chunks_init()
-            if chunks is None:
-                raise ValueError("Failed to create mtmd input chunks")
-
-            try:
-                if len(bitmaps) > 0:
-                    bitmap_array = (self._mtmd_cpp.mtmd_bitmap_p_ctypes * len(bitmaps))(*bitmaps)
-                    ret = self._mtmd_cpp.mtmd_tokenize(
-                        self.mtmd_ctx, chunks,
-                        ctypes.byref(input_text), bitmap_array, len(bitmaps),
+            for _start, _end, chunk_ptr, chunk_type, _media_id in chunk_token_spans:
+                if chunk_type == self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_TEXT:
+                    n_tok_out = ctypes.c_size_t(0)
+                    tok_ptr = self._mtmd_cpp.mtmd_input_chunk_get_tokens_text(
+                        chunk_ptr, ctypes.byref(n_tok_out)
                     )
-                else:
-                    ret = self._mtmd_cpp.mtmd_tokenize(
-                        self.mtmd_ctx, chunks,
-                        ctypes.byref(input_text), None, 0,
+                    if tok_ptr and n_tok_out.value > 0:
+                        tokens = [tok_ptr[j] for j in range(n_tok_out.value)]
+                        slot_start = n_accum
+                        llama.eval(tokens)
+                        # output_reserve flushed the PREVIOUS call; this call's
+                        # data will be flushed by the NEXT output_reserve call.
+                        text_slot_ranges.append((slot_start, slot_start + len(tokens)))
+                        n_accum += len(tokens)
+
+                else:  # IMAGE or AUDIO
+                    chunk_n_tokens = self._mtmd_cpp.mtmd_input_chunk_get_n_tokens(chunk_ptr)
+                    slot_start = n_accum
+                    new_n_past = llama_cpp_lib.llama_pos(0)
+                    ret = self._mtmd_cpp.mtmd_helper_eval_chunk_single(
+                        self.mtmd_ctx,
+                        llama._ctx.ctx,
+                        chunk_ptr,
+                        llama_cpp_lib.llama_pos(llama.n_tokens),
+                        llama_cpp_lib.llama_seq_id(0),
+                        llama.n_batch,
+                        True,
+                        ctypes.byref(new_n_past),
                     )
-                if ret != 0:
-                    raise ValueError(f"mtmd_tokenize failed: {ret}")
+                    if ret != 0:
+                        raise ValueError(f"mtmd_helper_eval_chunk_single failed: {ret}")
+                    llama.n_tokens = new_n_past.value
+                    # mtmd_helper_eval_chunk_single may split into multiple
+                    # internal llama_decode calls (each flushes the previous
+                    # into accum via output_reserve). chunk_n_tokens is the
+                    # true token count regardless of M-RoPE n_pos advance.
+                    if chunk_n_tokens > 0:
+                        image_slots.append(slot_start + chunk_n_tokens - 1)
+                    n_accum += chunk_n_tokens
 
-                # ── Reset context ─────────────────────────────────────────
-                llama.reset()
-                llama._ctx.memory_clear(True)
+            # Flush the LAST decode call (not yet flushed by output_reserve).
+            llama_cpp_lib.llama_flush_penultimate_accum(llama._ctx.ctx)
 
-                # ── Walk chunks, track text vs image positions, decode ────
-                text_positions = []
-                image_positions = []
-                n_past = 0
-                n_chunks = self._mtmd_cpp.mtmd_input_chunks_size(chunks)
+            # ── Select which accum slots to return ────────────────────────
+            if include == "text":
+                slots = [s for (lo, hi) in text_slot_ranges for s in range(lo, hi)]
+            elif include == "image":
+                slots = image_slots
+            else:
+                text_slots = [s for (lo, hi) in text_slot_ranges for s in range(lo, hi)]
+                slots = sorted(text_slots + image_slots)
 
-                for i in range(n_chunks):
-                    chunk = self._mtmd_cpp.mtmd_input_chunks_get(chunks, i)
-                    if chunk is None:
-                        continue
-                    ctype = self._mtmd_cpp.mtmd_input_chunk_get_type(chunk)
+            if not slots:
+                raise ValueError(
+                    "No token positions selected — check 'include' parameter"
+                )
 
-                    if ctype == self._mtmd_cpp.mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_TEXT:
-                        n_tok_out = ctypes.c_size_t(0)
-                        tok_ptr = self._mtmd_cpp.mtmd_input_chunk_get_tokens_text(
-                            chunk, ctypes.byref(n_tok_out)
-                        )
-                        if tok_ptr and n_tok_out.value > 0:
-                            tokens = [tok_ptr[j] for j in range(n_tok_out.value)]
-                            start = n_past
-
-                            # Build batch with ALL logits flags set so every
-                            # token position has its embedding stored
-                            batch = llama_cpp.llama_batch_init(len(tokens), 0, 1)
-                            for k, tok in enumerate(tokens):
-                                batch.token[k] = tok
-                                batch.pos[k] = n_past + k
-                                batch.n_seq_id[k] = 1
-                                batch.seq_id[k][0] = 0
-                                batch.logits[k] = 1  # mark ALL as output
-                            batch.n_tokens = len(tokens)
-
-                            ret = llama_cpp.llama_decode(llama._ctx.ctx, batch)
-                            llama_cpp.llama_batch_free(batch)
-                            if ret != 0:
-                                raise ValueError(f"llama_decode failed: {ret}")
-
-                            text_positions.extend(range(start, start + len(tokens)))
-                            n_past += len(tokens)
-                            llama.n_tokens = n_past
-
-                    else:  # IMAGE or AUDIO
-                        new_n_past = llama_cpp.llama_pos(0)
-                        ret = self._mtmd_cpp.mtmd_helper_eval_chunk_single(
-                            self.mtmd_ctx, llama._ctx.ctx, chunk,
-                            llama_cpp.llama_pos(n_past),
-                            llama_cpp.llama_seq_id(0),
-                            llama.n_batch,
-                            False,  # logits_last
-                            ctypes.byref(new_n_past),
-                        )
-                        if ret != 0:
-                            raise ValueError(f"mtmd_helper_eval_chunk_single failed: {ret}")
-
-                        image_positions.extend(range(n_past, new_n_past.value))
-                        n_past = new_n_past.value
-                        llama.n_tokens = n_past
-
-                # ── Select which positions to return ──────────────────────
-                if include == "text":
-                    positions = text_positions
-                elif include == "image":
-                    positions = image_positions
-                else:
-                    positions = sorted(text_positions + image_positions)
-
-                if not positions:
-                    raise ValueError(
-                        "No token positions selected — check 'include' parameter"
+            # ── Read back hidden states from the accumulation buffer ───────
+            results = []
+            for slot_idx in slots:
+                if layer == "penultimate":
+                    ptr = llama_cpp_lib.llama_get_embeddings_penultimate_accum_ith(
+                        llama._ctx.ctx, ctypes.c_int32(slot_idx)
+                    )
+                else:  # "final" — final layer embeddings don't have the same
+                        # batching problem since embd is in POOLING_TYPE_NONE mode;
+                        # fall back to the per-call getter (slot = position for final)
+                    ptr = llama_cpp_lib.llama_get_embeddings_ith(
+                        llama._ctx.ctx, ctypes.c_int32(slot_idx)
                     )
 
-                # ── Read back hidden states ───────────────────────────────
-                n_embd = llama.n_embd()
-                results = []
+                if not ptr:
+                    raise RuntimeError(
+                        f"llama_get_embeddings_{'penultimate_accum' if layer == 'penultimate' else ''}_ith "
+                        f"returned NULL for accum slot {slot_idx}. "
+                        f"{'Requires patched qwen35/qwen3vl/qwen3.cpp.' if layer == 'penultimate' else 'Check embeddings=True and POOLING_TYPE_NONE.'}"
+                    )
 
-                for tok_idx in positions:
-                    if layer == "penultimate":
-                        ptr = llama_cpp.llama_get_embeddings_penultimate_ith(
-                            llama._ctx.ctx, ctypes.c_int32(tok_idx)
-                        )
-                    else:  # "final"
-                        ptr = llama_cpp.llama_get_embeddings_ith(
-                            llama._ctx.ctx, ctypes.c_int32(tok_idx)
-                        )
+                vec = np.ctypeslib.as_array(ptr, shape=(n_embd,)).copy()
+                results.append(vec)
 
-                    if ptr is None:
-                        if layer == "penultimate":
-                            raise RuntimeError(
-                                f"llama_get_embeddings_penultimate_ith returned NULL "
-                                f"for token {tok_idx}. Ensure the model's graph "
-                                f"builder populates t_embd_penultimate (requires "
-                                f"patched qwen3vl.cpp / qwen3.cpp)."
-                            )
-                        raise RuntimeError(
-                            f"llama_get_embeddings_ith returned NULL for token "
-                            f"{tok_idx}. Ensure embeddings=True and "
-                            f"LLAMA_POOLING_TYPE_NONE."
-                        )
-
-                    vec = np.ctypeslib.as_array(ptr, shape=(n_embd,)).copy()
-                    results.append(vec)
-
-                return np.stack(results, axis=0)  # [n_selected_tokens, n_embd]
-
-            finally:
-                self._mtmd_cpp.mtmd_input_chunks_free(chunks)
+            return np.stack(results, axis=0)  # [n_selected_tokens, n_embd]
 
         finally:
+            if chunks is not None:
+                self._mtmd_cpp.mtmd_input_chunks_free(chunks)
             for bitmap in bitmap_cleanup:
                 self._mtmd_cpp.mtmd_bitmap_free(bitmap)
 
@@ -3923,7 +3862,27 @@ while also answering every question accurately, clearly, and step-by-step when a
             base64_data = image_url[comma_pos + 1 :]
             image_bytes = base64.b64decode(base64_data)
 
-        # 2. Handle local/remote URL
+        # 2. Handle local file path (absolute Windows or POSIX path)
+        elif (
+            (len(image_url) >= 2 and image_url[1] == ":")  # Windows drive letter, e.g. C:\...
+            or image_url.startswith("/")
+            or image_url.startswith("\\\\")
+            or image_url.startswith("file://")
+        ):
+            local_path = image_url
+            if local_path.startswith("file://"):
+                import urllib.parse
+                local_path = urllib.parse.unquote(local_path[7:]).lstrip("/")
+                # On Windows, file:///C:/... → C:/...
+                if len(local_path) >= 2 and local_path[1] != ":":
+                    local_path = "/" + local_path
+            try:
+                with open(local_path, "rb") as f:
+                    image_bytes = f.read()
+            except OSError as e:
+                raise ConnectionError(f"Failed to read local image {local_path}: {e}")
+
+        # 3. Handle remote URL
         else:
             headers = {"User-Agent": "Mozilla/5.0"}
             req = urllib.request.Request(image_url, headers=headers)
