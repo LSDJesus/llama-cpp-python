@@ -7,6 +7,499 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.37] MoE CPU Offloading, O(1) Speculative Decoding, Thread-Safe Abort & New LLM Wiki
+
+- docs: A basic new documentation system for the LLM-Wiki has been initially established.
+    - Based on the continuously optimized `SCHEMA.md`, I am attempting to enable AI to automatically learn code files and write and update corresponding Markdown documents. 
+    - Currently, the documentation under the path `/docs/wiki/` is complete:
+        - `core/Llama.md`
+        - `modules/LlamaCache.md`
+        - `modules/LlamaEmbedding.md`
+        - `modules/LlamaSpeculative.md`
+        - `SCHEMA.md`
+        - `contributing-to-wiki.md`
+        - `index.md`
+    - The Github Wiki is now also synchronized with `/docs/wiki/index.md`
+    - Note: The LLM-wiki is still being expanded.
+
+- docs: update LLM wiki schema to v0.3
+    - Add schema metadata, documentation language rules, expanded page templates, attribute/state documentation guidance, and clearer update rules for LLM-maintained llama-cpp-python wiki pages.
+
+- feat(llama): add fine-grained MoE CPU offloading controls
+    - Introduce `cpu_moe` (bool) and `n_cpu_moe` (int) parameters to `Llama.__init__` for precise Mixture of Experts (MoE) weight offloading.
+    - `cpu_moe=True` forces all MoE expert weights to the CPU memory, regardless of `n_gpu_layers`.
+    - `n_cpu_moe=N` offloads the expert weights of the first N layers to the CPU, while keeping attention and router weights on the GPU.
+    - Enhance `n_gpu_layers` to accept string literals "auto" (equivalent to -1) and "all" (equivalent to -2) alongside exact integers, improving configuration readability.
+    - Update internal module aliases (e.g., `llama_cpp` to `llama_cpp_lib`) to avoid naming conflicts with the underlying C library.
+    - Integrate `ggml_backend_cpu_buffer_type` to map specific tensor overrides (via regex) directly to CPU buffers during model load.
+
+- feat(_ggml): implement ggml-backend API bindings and fix type hints
+    - Introduces extensive ctypes bindings for `ggml-backend.h` (devices, buffers, registries, and CPU buffer types) to support advanced memory routing like MoE CPU offloading. Also fixes various static typing warnings by adding `# type: ignore` to pointer annotations.
+    - *Note: Synchronize ggml's ctypes calls as needed, but won't fully implement it, because most of it is called at the lower level in the upstream llama.cpp.*
+
+- feat(handler): Support `add_generation_prompt` parameter pass to `MTMDChatHandler`
+    - supports disabling assistant part injection, used to support the multimodal `assistant_prefill` functionality.
+
+- feat(core): implement thread-safe generation abort mechanism
+    - Add `AbortCriteria` class and a thread-safe `Llama.abort()` method to allow graceful interruption of ongoing text generation from external threads (e.g., UI or async environments).
+    - Automatically inject `AbortCriteria` into the stopping criteria sequence at the start of `_create_completion`.
+    - Ensure that when an abort is triggered, the partially generated `completion_tokens` are correctly detokenized and preserved.
+    - Set `finish_reason` to `"abort"` when generation is interrupted, allowing downstream streaming clients to correctly identify manual cancellations.
+    - Simplify and optimize the stopping criteria evaluation logic within the core `generate` loop.
+    - Reorganize and sort module imports for better readability.
+    - Update /docs/wiki/core/Llama.md for `abort()` and example code
+
+- feat(speculative): introduce O(1) hash-based N-Gram speculative decoding
+    - Add `LlamaNGramMapDecoding` to `llama_speculative.py`, implementing an ultra-fast speculative decoder based on a hash inverted index and incremental updates.
+    - Achieve O(1) time complexity for draft token generation, completely eliminating the CPU bottleneck present in the legacy Numpy sliding window approach.
+    - Update `README.md` and `docs/wiki/core/Llama.md` to recommend `LlamaNGramMapDecoding` as the default and fastest speculative decoding method, along with updated initialization examples.
+    - Add docs comment to the speculative decoding classes for better developer experience.
+    - Add warnings to the legacy `LlamaPromptLookupDecoding` class regarding its high computational overhead for long contexts.
+
+- docs: Update README.md
+
+- feat(types): introduce MCP definitions and align with latest OpenAI spec
+    - Add comprehensive Model Context Protocol (MCP) type definitions, including `MCPTool`, `MCPToolCall`, `MCPListTools`, connector IDs, and approval filters to support remote server tool calling.
+    - Add `ServiceTier` literal ("auto", "default", etc.) and include the `service_tier` field in `CreateChatCompletionResponse`.
+    - Restrict `finish_reason` in completion responses to strict standard literals (`stop`, `length`, `tool_calls`, `content_filter`, `function_call`).
+    - Introduce `ChatCompletionMessageCustomToolCall` to support custom tool calls generated by the model.
+    - Update `ChatCompletionRequestAssistantMessage` to include the `name` field and add descriptive docstrings to message types.
+
+- docs: initialize LLM Wiki structure for better documentation maintenance
+    - Create docs/wiki/ directory with full folder structure
+    - Add SCHEMA.md, index.md and contributing guidelines
+    - Set up core/, features/, modules/, examples/, types/ and subdirectories
+    - Prepare for LLM-powered living documentation (Llama class, multi-modal chat handlers, vision/audio examples, etc.)
+    - Include .gitkeep files to preserve empty directories
+
+    This lays the foundation for a modern, maintainable wiki that will replace outdated static docs.
+    Future commits will populate pages with up-to-date content generated from latest source code.
+
+- chore(ci): upgrade astral-sh/setup-uv@v7 and Jimver/cuda-toolkit@v0.2.35 (Node 24 runtime)
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/63d93d17336e41e4cc73a64451e5b1d2477abdb1](https://github.com/ggml-org/llama.cpp/commit/63d93d17336e41e4cc73a64451e5b1d2477abdb1)
+
+- feat: Sync llama.cpp llama/mtmd API Binding 20260421
+
+More information see: https://github.com/JamePeng/llama-cpp-python/compare/b97cb637cd6124fc47f569721b1716014bd856a8...374c0d00aab924f03c18a2a53ab65c2fa20ce66c
+
+## [0.3.36] Gemma-4 Omni-Multimodal and ToolCall Improved, Qwen3.6 / Step3-VL Support, Compilation workflow optimization
+
+- feat: enhance `Qwen35ChatHandler` with preserve_thinking and `Qwen3.6` Support
+    - Add `preserve_thinking` parameter to optionally retain `<think>` reasoning
+    blocks across all historical conversational turns (defaults to False to save tokens).
+    - Improve template robustness by adding an `is defined` safety check for `enable_thinking`.
+    - Simplify JSON serialization logic for tool call arguments in the Jinja template.
+    - Update class docstring to explicitly indicate support for `Qwen 3.5` and `Qwen 3.6` models.
+    - Include `preserve_thinking` state in verbose processing logs.
+
+- docs: add comprehensive omni multimodal example for Gemma-4 (See here: [Gemma 4 Omni Example](https://github.com/JamePeng/llama-cpp-python?tab=readme-ov-file#comprehensive-omni-multimodal-example-gemma-4-vision--audio--text))
+    - Wrapped the existing Qwen3-VL image loading example in a `<details>` block to improve README readability and save vertical space.
+    - Introduced a complete, production-ready "Omni MultiModal" example demonstrating simultaneous Vision and Audio processing using the `Gemma4ChatHandler`.
+    - Added a universal `build_media_payload` helper function to dynamically route and encode local files into OpenAI-compatible `image_url` and `input_audio` payload structures.
+    - Added crucial documentation clarifying multimodal capability differences across Gemma-4 variants (E2B/E4B supporting full audio/vision vs. 31B/26BA4B supporting vision only).
+
+
+- docs: add audio processing recommendation to Gemma4ChatHandler
+    - Recommend BF16 mmproj for Gemma4 E2B and E4B models.
+    - Note known degraded audio performance with other quantizations.
+    - Add reference link to the relevant llama.cpp PR/issue comment.
+
+- refactor: update Gemma4ChatHandler with latest google/gemma-4-31B-it chat template from huggingface
+    - Sync `Gemma4ChatHandler` logic with the upstream chat template, incorporating the new `format_tool_response_block` and OpenAI-compatible forward-scan tool resolution.
+
+- Update README.md for OpenVINO/Metal/Vulkan/SYCL
+
+- Implement `Step3VLChatHandler` for `Step3-VL-10B`
+
+- feat(types): align with latest OpenAI API spec and fix type issues
+    - Expand `CompletionUsage` with `PromptTokensDetails` and `CompletionTokensDetails` for granular token tracking.
+    - Add `usage` to `CreateChatCompletionStreamResponse` to support usage reporting in streaming mode.
+    - Fix duplicate `object` field in `CreateCompletionResponse`.
+    - Update `ChatCompletionRequestAssistantMessage` to accept `None` for `content` and introduce the new `refusal` field.
+    - Clean up `ChatCompletionRequestMessage` Union by removing the duplicate user message type.
+    - Broaden `ChatCompletionToolChoiceOption` to fully support `allowed_tools` and `custom` tool choice behaviors.
+
+- feat(ci): Optimizing the GitHub build workflow for CUDA and METAL
+    - Update CI Action runner version
+        - microsoft/setup-msbuild@v2 -> v3
+        - actions/checkout@v5 -> v6
+        - actions/upload-artifact@v4 -> v6
+        - actions/download-artifact@v4 -> v6
+        - softprops/action-gh-release@v2 -> v3
+    - ci: restrict cudaarch to Volta-Hopper to fix GitHub Actions timeout
+        - Using the `all` option for `cudaarch` on CUDA 12.4-12.6 causes the compilation process to exceed the 6-hour maximum execution limit on GitHub Actions, leading to cancelled jobs.
+
+        - To resolve this and reduce build times, the target architectures are now restricted to explicitly support compute capabilities 7.0 through 9.0 (`70-real` to `90-real`). This maintains support for all modern NVIDIA GPUs equipped with Tensor Cores (from Volta up to Hopper architectures) while keeping the build time safely within CI constraints.
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/9db77a020c97ac3b13b7c1bf4e0c5787001533e7](https://github.com/ggml-org/llama.cpp/commit/9db77a020c97ac3b13b7c1bf4e0c5787001533e7)
+
+- feat: Sync llama.cpp llama/mtmd API Binding 20260415
+
+More information see: https://github.com/JamePeng/llama-cpp-python/compare/e1ade17c6330e3cc46a2b08f9b48b1540521b231...7820677e65827b6f3356f651da9be8d510ba10e5
+
+## [0.3.35] Gemma 4 series & LFM 2.5-VL Support, OpenAI OpenAPI Alignment and Logging Architecture Migration
+
+- fix: expand stop sequences for `Gemma4ChatHandler`
+    - Add `GEMMA4_EOS_TOKEN` and `GEMMA4_STR_TOKEN` to the generation stop criteria.
+    - Align the stopping logic with the model's `generation_config.json` definitions.
+    - Prevent potential over-generation by ensuring the model halts correctly at standard EOS or when initiating a tool response.
+
+- feat(types): align with latest OpenAI OpenAPI spec (audio, structured outputs)
+    - Update llama_types.py OpenAI [OpenAPI Link](https://app.stainless.com/api/spec/documented/openai/openapi.documented.yml)
+    - Add `developer` role.
+    - Replace Anyscale-specific JSON schema with official OpenAI `json_schema` response format for Structured Outputs.
+    - Add `input_audio` and `file` types to request message content parts.
+    - Add `audio`, `refusal`, and `annotations` (e.g., URL citations) fields to response messages.
+    - Add `content_filter` to finish reasons and strictly define global `ChatCompletionRole`.
+
+- docs: clarify `enable_thinking` compatibility for **Gemma 4** models
+    - Update `Gemma4ChatHandler` class docstring and `__init__` args documentation.
+    - Specify that the `enable_thinking` toggle is exclusively supported by Gemma4 31B and 26BA4B variants.
+    - Explicitly note that E2B and E4B models do not currently support this feature to prevent configuration errors.
+
+- feat(chat_format): Implemented `Gemma4ChatHandler`, add Gemma 4 chat handler with multimodal and tool support
+    - Implement `Gemma4ChatHandler` with Gemma 4 specific tokens (`<|turn>`, `<|channel>`, etc.).
+    - Add complex Jinja2 template for advanced nested tool/function schema formatting.
+    - Support multimodal content injection for `image_url`, `audio_url`, and `input_audio` (including base64 reconstruction).
+    - Integrate reasoning/thinking controls via `enable_thinking` toggle and `<|channel>thought` formatting.
+    - Configure `<turn|>` as the primary stop sequence for generation boundaries.
+
+- feat(chat_format) Implemented `LFM25VLChatHandler` for **LFM2.5-VL** (by **@alcoftTAO**)
+
+- fix Qwen3.5 chat template typos(reported by **@abdullah-cod9**)
+
+- refactor(logger): migrate from llama_log_callback to ggml_log_callback
+    - Remove the deprecated `llama_log_callback` typedef from `llama_cpp.py`.
+    - Update `_logger.py` to use `ggml_log_callback` from `_ggml`, aligning with the upstream GGML logging architecture.
+    - Rename the callback references across the codebase, including the MTMD context initialization in `llama_chat_format.py`.
+
+- feat(ggml): add support for ggml-base library and new function bindings
+    - Load the new `ggml-base` shared library alongside `ggml`.
+    - Add `ctypes` bindings for `ggml_log_get`, `ggml_log_set`, and `ggml_set_zero` using the `ggml_base_function` decorator.
+
+- Update README.md
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/58190cc84d846d8575ba26e8486bc29d9fd8ad55](https://github.com/ggml-org/llama.cpp/commit/58190cc84d846d8575ba26e8486bc29d9fd8ad55)
+
+- feat: Sync llama.cpp llama/mtmd API Binding 20260402
+
+More information see: https://github.com/JamePeng/llama-cpp-python/compare/a184583e908cc138fd15794986b3581521fb9b0c...232092e32b3563159a86aacb168da06c4937192b
+
+## [0.3.34] Dynamic LoRA Routing, Control Vectors, and Assistant Prefill
+
+- **feat(chat_format): added assistant_prefill to seamlessly continue responses**
+    - This commit introduces the `assistant_prefill` parameter to the chat completion API, satisfying the highly requested need to continue interrupted or partially generated assistant messages.
+    - Resolves #97 (Chat completion from unfinished response)
+    - Usage:
+        - Simply set `assistant_prefill=True` in `create_chat_completion` when the final item in your `messages` list is a partial `assistant` response. The engine will use it as a prompt base and continue generating seamlessly.
+    - docs(readme): add documentation for Assistant Prefill features
+        - Also slightly updated the `huggingface_hub` installation instructions for accuracy.
+
+- **feat(internals): implement dynamic LoRA routing and Control Vector support**
+    * This commit overhauls the adapter management architecture in `_internals.py` to support **dynamic, per-request LoRA routing and Control Vector (CVec) injection** with strict C++ memory safety.
+
+    * Key changes:
+        - Secure Memory Management: Introduced the `LlamaLoraAdapter` wrapper class to securely handle the lifecycle of `llama_adapter_lora_p` pointers, preventing VRAM leaks. Also added support for extracting ALoRA invocation tokens.
+        - Model-Level Registry: Added `_lora_registry` to `LlamaModel` with robust methods (`load_lora`, `unload_lora`, `unload_all_loras`) to preload adapters into VRAM. Integrated cleanup into the model's `ExitStack` and `close()` methods for deterministic memory release.
+        - Context-Level Dynamic Routing: Implemented `apply_loras` and `clear_loras` in `LlamaContext` to dynamically swap compute graph weights using contiguous C arrays, enabling zero-delay multi-tenant LoRA switching.
+        - Control Vector Integration: Added `apply_cvec` and `clear_cvec` to `LlamaContext` for representation engineering. Includes strict C++ memory layout validation (enforcing buffer zero-padding up to `n_embd * il_end`) to prevent silent write failures in the GGML backend.
+        - Observability & Docs: Added verbose logging for adapter/CVec application and expanded docstrings for context utility methods (e.g., threading, causal attention, warmup).
+        - Update README.md for Dynamic LoRA Routing & Control Vectors
+
+- fix(types): correct llama_adapter_get_alora_invocation_tokens ctypes signature and use pointer for llama_token
+
+- fix(types): correct llama_set_adapters_lora LoRA adapter ctypes signature and use pointer for scales
+    - change scale: float to float* (POINTER(c_float))
+    - make adapters and scales optional arrays to match C API
+
+- refactor: remove legacy static LoRA initialization
+    - Removed `lora_base`, `lora_path`, and `lora_scale` from `Llama` init parameters and state.
+    - Dropped outdated `llama_adapter_lora_init` and `llama_set_adapters_lora` bindings in the constructor.
+    - Restored default `use_mmap` behavior (no longer forced to False when LoRA is present).
+
+    * This removes the global context pollution and paves the way for the new dynamic, per-request LoRA routing architecture.
+
+- chore: enhance hybrid cache logging and document M-RoPE token usage
+    - Added explanatory comments detailing why n_tokens is used instead of chunk_n_pos for M-RoPE models (to prevent the system from skipping evaluation).
+    - Added verbose logging for hybrid cache clearance scenarios (when checkpoints are missing, restore fails, or max_checkpoints is 0).
+
+- feat(core): add verbose debug logging to longest_token_prefix fast paths
+    - Added an optional `verbose` parameter to `Llama.longest_token_prefix` to explicitly log early-exit conditions. This provides crucial visibility into cache-miss behaviors during debugging by outputting the specific reason for a fast exit (e.g., empty sequence vs. mismatched first token) along with the offending sequence lengths or token values.
+
+- Update MIT license copyright to collective authorship (2023-2026)
+    - Change `single-author` copyright to `The llama-cpp-python authors`
+      and apply standard multi-line formatting for better readability.
+    - Every contributor who participates and makes an effort makes the project more reliable, efficient,
+      and user-friendly, and they all deserve to be remembered.
+    - Welcome to join us in promoting the project and enriching the open-source community.
+
+- Update CMakeLists.txt
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/0fcb3760b2b9a3a496ef14621a7e4dad7a8df90f](https://github.com/ggml-org/llama.cpp/commit/0fcb3760b2b9a3a496ef14621a7e4dad7a8df90f)
+
+- feat: Sync llama.cpp llama/mtmd API Binding 20260325
+
+More information see: https://github.com/JamePeng/llama-cpp-python/compare/6bbc8d2306319c67c9f7d0d2d0576496f3587a3c...a8cec004466493db57d3cbc043cdc897b2b37f9b
+
+## [0.3.33] Fixing Multimodal Image Freezes, Stabilizing Logits, and Optimized Legacy Cache Logic
+
+- perf(mtmd): optimize media_id masking with bitwise AND
+    - Replaced the modulo operation (`% (2**24)`) with a bitwise AND mask (`& 0xFFFFFF`) when calculating the deterministic `media_id` from the CRC32 hash. This is a micro-optimization that leverages faster native CPU bitwise instructions instead of division, resulting in more idiomatic and performant low-level bit masking.
+    - When processing 1-2 images, the difference between % and & is only a few nanoseconds, imperceptible to the user. In future video processing, you might need to frantically calculate IDs within a for loop for 100 or even 300 frames of data. In this case, the extremely low CPU overhead of the bitwise operation & 0xFFFFFF ensures that the main thread will not experience any computational blockage at the Python layer when building a virtual ledger of tens of thousands of characters.
+
+- fix(mtmd): prevent multimodal image freeze by injecting deterministic media IDs
+    - Fixed a critical "image freeze" bug (report by **@KLL535**) where the model would continuously reuse the first cached image regardless of new inputs.
+    - The issue occurred because the C++ `self._mtmd_cpp.mtmd_input_chunk_get_id(chunk)` parser returns an empty ID (`b''`) for placeholder tokens like `<__media__>`, causing all media to fallback to the same magic number (`-314159`). This resulted in false-positive KV cache prefix matches.
+    - Replaced the C++ chunk ID extraction with a Python-side `media_item_cursor` that generates a deterministic 32-bit negative ID using `zlib.crc32(real_media_url)`.
+    - This ensures `longest_token_prefix` correctly identifies and reuses identical images while instantly breaking the cache match when the image content changes.
+    * Chat Structure: **[System Prompt] + [Image] + [Question]**
+    - The computational cost should be significantly reduced for the same image but different questions.
+
+- fix(Llama.generate): add explicit fallback context reset and expand Llama.generate docstrings
+    - Added a fallback `if reset:` block in `Llama.generate` to ensure the KV cache and hybrid cache manager are explicitly cleared when `reset=True` is passed and no prefix match is found. This prevents potential context poisoning from previous runs.
+    - Added comprehensive docstrings to the `generate` method for all newly integrated sampler parameters (e.g., XTC, Mirostat, DRY penalties etc.).
+    - Added explicit verbose logging for cache resetting, rollback events, and speculative decoding behaviors to improve debuggability.
+
+- docs(README.md): add sampling parameter guide and strategic project tips to README
+    - Sampling Documentation: Added a comprehensive guide for `LlamaSamplingParams`. It covers core, advanced (XTC, Dynatemp, Adaptive-P), entropy (Mirostat), and DRY repetition penalty configurations with a clean Python usage example.
+    - Project Tips: Added a new "Quick tips" section to explicitly communicate the semi-deprecated status of `llama_cpp.server` in favor of the upstream `llama-server`.
+    - Backend Recommendations: Added practical advice for AMD and Intel GPU users, officially recommending the Vulkan backend for cross-platform stability and faster updates.
+
+- fix(sampling): prevent memory drift and hallucinations in logits view
+    - Previously, the numpy view for `logits_ptr` in `LlamaSamplingContext.sample` was only initialized once. If the underlying C++ buffer was reallocated or shifted (e.g., due to dynamic batch sizes or KV cache shifts), the numpy array would point to stale memory, leading to severe model hallucinations or segfaults.
+    - Added explicit `_logits_ptr_addr` tracking to monitor the physical C memory address.
+    - The zero-copy numpy view (`_logits_view`) is now safely recreated on-the-fly whenever the backend memory address changes.
+    - Added proper initialization and garbage collection for the new tracker in `__init__` and `close`.
+
+- feat(_ggml): extend ctypes bindings with more ggml constants, enums, and structs
+
+- fix(chat_handler): fix tools and function calling in MTMDChatHandler.(Issue reported by **@alcoftTAO**)
+
+- perf(cache): optimize LlamaDiskCache I/O and fix LRU behavior
+    - Delegated LRU and size limits to native `diskcache` SQLite engine, removing the slow manual eviction loop.
+    - Added an O(1) early exit in `_find_longest_prefix_key` to prevent unnecessary full-table disk scans.
+    - Fixed a destructive read bug by replacing `.pop()` with standard access to properly update LRU timestamps.
+    - Added fast-path empty checks to bypass disk queries entirely when the cache is empty.
+
+- perf(cache): upgrade LlamaRAMCache to O(1) eviction and set LlamaTrieCache as default
+Addressed severe performance bottlenecks in legacy RAM caching components:
+    - Refactored `LlamaRAMCache` to use an O(1) `_current_size` tracker instead of an O(N) dynamic sum. This eliminates massive CPU spikes and O(N^2) complexity during LRU eviction cycles.
+    - Added strict OOM safeguards to `LlamaRAMCache`: The current size is explicitly clamped to 0 during evictions, and hard-reset to 0 if the cache empties, preventing catastrophic capacity drift.
+    - Introduced early-exit O(1) short-circuits in `__getitem__` and `__contains__` to bypass expensive prefix searches when the cache is empty.
+    - Updated the `LlamaCache` backward-compatibility alias to point to the highly optimized `LlamaTrieCache` instead of the legacy `LlamaRAMCache`.
+
+- fix(core): disable swa_full for non-SWA models (sync llama.cpp upstream #20291)
+    - Fallback `context_params.swa_full` to False if `_n_swa == 0` and emit a warning.
+    - Updated `is_hybrid` validation to use the resolved `self.context_params.swa_full` state.
+
+- fix(chat_format): fix namespace and variable shadowing of llama modules
+    - Changed imports to use `llama_cpp_lib` and `llama_core` to avoid namespace collisions.
+    - Fixed severe variable shadowing where the `llama` module was being overshadowed by the `llama` parameter in function signatures.
+    - Updated associated type hints and C-API bindings to use the new isolated aliases.
+    - Corrected `LlamaGrammar` type definitions to point to the `llama_grammar` module.
+
+- fix(cache): fix namespace shadowing to prevent AttributeError (Issue reported by **@kantan-kanto**)
+    - Renamed `llama_cpp.llama` import to `llama_core` and `llama_cpp.llama_cpp` to `llama_cpp_lib` to prevent namespace collision.
+    - Fixed `AttributeError` thrown when accessing `llama_cpp.llama.Llama.longest_token_prefix`.
+    - Updated all associated type hints and C-API bindings in cache classes to use the new isolated aliases.
+
+- feat(MTMDChatHandler): support audio inputs and fix interleaved media ordering
+    - Refactored `CHAT_FORMAT` to use a single loop for `message.content`, preserving the exact chronological order of interleaved text, images, and audio.
+    - Added template routing for `audio_url`.
+    - Added template routing for OpenAI's `input_audio` format, properly formatting it as a Data URI.
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/d23355afc319f598d0e588a2d16a4da82e14ff41](https://github.com/ggml-org/llama.cpp/commit/d23355afc319f598d0e588a2d16a4da82e14ff41)
+
+- feat: Sync llama.cpp llama/mtmd API Binding 20260313
+
+More information see: https://github.com/JamePeng/llama-cpp-python/compare/e7e1d48065ba53846f290cfe563c8c839a062ebe...b0f00a96d3803863dd7d479f0cb1305f76f741b3
+
+## [0.3.32] Hybrid/Multimodal Model Single-Turn Optimizations & Fix Sampling Seed
+
+- perf(hybrid): optimize multimodal single-turn and fix KV clear bug
+    - Added a 100% match "FAST PATH" in Llama.generate to bypass N-1 truncation for hybrid models when caching is disabled.
+    - Fixed a bug where failed rollbacks on disabled caches would wipe the KV cache, causing multimodal pseudo-token crashes.
+    - Updated MTMDChatHandler to suppress cache-related logs and anchoring logic when max_checkpoints <= 0.
+
+- perf(hybrid): prevent expensive array slicing when cache is disabled
+    - Added a `max_checkpoints > 0` check to the `finally` block of the generation loop.
+    - Previously, even though the underlying C++ state extraction was bypassed, the Python layer was still executing `self._input_ids[:self.n_tokens].tolist()`. For long contexts, slicing and converting this massive array to a Python list caused unnecessary CPU overhead and garbage collection (GC) pressure. This intercept acts as a double-layer isolation, ensuring absolute zero memory allocation and zero overhead for hybrid models running in single-turn mode.
+
+- perf(hybrid): bypass N-1 evaluation split if max_checkpoints is 0
+    - Prevent fragmenting the prompt evaluation into `len(tokens)-1` and `1` when hybrid caching is disabled.
+    - Allows the underlying C++ engine to process the entire prompt in a single, efficient batch for single-turn workflows.
+
+- perf(hybrid): eliminate PCIe I/O latency for single-turn workflows
+    - This commit introduces critical performance optimizations and log tracing improvements for HybridCheckpointCache in single-turn workflows (e.g., ComfyUI or single-turn conversation mode):
+        - Now support 0 HybridCheckpointCache for single-turn conversation.(set the `ctx_checkpoints=0` when llama init )
+        - Added early-exit intercepts for `max_checkpoints <= 0` in `save_checkpoint` and `find_best_checkpoint`. This prevents massive (e.g., 150MB+) synchronous VRAM-to-RAM state extractions over the PCIe bus when rollback capabilities are disabled, eliminating a ~3-second blocking delay at the end of generation.
+        - Added a non-empty check in `clear()` to prevent log spam when the cache is already empty or disabled.
+        - Standardized logging prefixes (e.g., `HybridCheckpointCache(save_checkpoint)`) for better observability.
+        - Fixed a potential `UnicodeEncodeError` hazard in warning logs by replacing a non-standard arrow character with standard ASCII (`->`).
+
+- fix(sampling): pass seed to sampling context and remove global mutation
+    - Add `seed` parameter to `generate` and `sample` method signatures.
+    - Pass the resolved seed directly to `LlamaSamplingParams` to ensure the underlying C++ sampler uses it.
+    - Remove thread-unsafe `self.set_seed()` calls in `_create_completion` to prevent global state pollution during concurrent requests.
+
+- docs(issue-template): modernize bug report for efficiency
+    - Completely revamped the legacy bug report template to streamline troubleshooting. Added an anti-AI-spam policy, a detailed OS/Hardware matrix, forced `verbose=True` logging requirements with code examples, and new sections for model parameters and AI-assisted brainstorming.
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/b283f6d5b3d2d079019ae5ed3cbbdb4b3be03b25](https://github.com/ggml-org/llama.cpp/commit/b283f6d5b3d2d079019ae5ed3cbbdb4b3be03b25)
+
+## [0.3.31] Omni-Modal Media Pipeline, Hybrid 1-Token Rollback and Enhanced Logging
+
+- refactor(mtmd): introduce omni-modal media pipeline with experimental audio support
+This commit significantly overhauls the media parsing and loading pipeline in `MTMDChatHandler` to gracefully handle both vision and audio inputs, establishing a true omni-modal architecture.
+
+    Key structural changes:
+    - Hardware Capability Sniffing: `_init_mtmd_context` now actively probes the C++ backend for `ctx_v` (vision) and `ctx_a` (audio) encoders, enabling proactive fail-fast validation before media processing.
+    - Unified Media Extraction: Replaced `get_image_urls` and `split_text_on_image_urls` with a robust `_get_media_items` method. This safely parses `image_url`, `input_audio`, and `audio_url` while strictly maintaining the chronological order of user prompts and enforcing OpenAI format specs.
+    - Media Dispatcher & Magic Bytes: Introduced a unified `load_media` dispatcher. Added a new `_load_audio` method and a rigorous `detect_audio_format` static method that accurately mimics `llama.cpp`'s C++ magic bytes sniffing (RIFF/WAVE, ID3/MPEG, fLaC) to prevent fatal backend crashes.
+    - Concurrent Omni-Decoding: The ThreadPoolExecutor in `_process_mtmd_prompt` has been upgraded to concurrently fetch and decode both image and audio payloads into unified `mtmd_bitmap` structures.
+
+    - **Note**: Audio processing capabilities in the underlying llama.cpp engine are currently in an experimental stage.
+
+- fix(hybrid): implement N-1 checkpointing to support 1-token rollbacks
+    - Forces an N-1 state snapshot during prompt prefilling for hybrid models. This ensures the engine can safely perform a 1-token rollback to refresh logits upon 100% cache matches (e.g., changing seeds on identical prompts), preventing RNN state desyncs and empty outputs.
+
+    - **Note**: For the Comfyui plugin developer, I recommend performing a reset operation before inputting the prompt word. This way, the seed will be included as one of the factors in the initial complete recalculation.
+
+- fix(mtmd): remove OS-level log suppression to expose critical C++ errors
+    - Removed the `suppress_stdout_stderr` context manager around critical C++ backend calls (`_init_mtmd_context`, `_create_bitmap_from_bytes`, and `close`).
+
+    - Previously, when `verbose=False`, this OS-level file descriptor redirection was swallowing fatal C++ backend errors (e.g., `stb_image` decoding failures, corrupted `.mmproj` model weights, or CUDA Out-Of-Memory aborts), resulting in silent crashes that were impossible to debug. The framework now correctly relies on the native C-API `llama_log_callback` to route logs to Python gracefully, ensuring that critical decoding and hardware exceptions remain visible to the developer.
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/f5ddcd1696eca5069dc7915f4d4c03c9a709afea](https://github.com/ggml-org/llama.cpp/commit/f5ddcd1696eca5069dc7915f4d4c03c9a709afea)
+
+## [0.3.30] Milestone Release
+
+I will update the release notes for version 0.3.30 in the [discussion](https://github.com/JamePeng/llama-cpp-python/discussions).
+
+- refactor(mtmd): redesign multimodal pipeline for concurrent I/O and hybrid state management
+This commit fundamentally restructures the `MTMDChatHandler` pipeline, decoupling the prefill and evaluation stages to resolve previous I/O bottlenecks and state-sync issues. The new architecture fully supports hybrid/recurrent multimodal models (e.g., Qwen3.5s, LFM2-VL) with robust context management.
+
+    Key structural advantages and changes:
+    - Concurrent Media Decoding: Implemented `ThreadPoolExecutor` in `_process_mtmd_prompt` with pre-allocated arrays, allowing thread-safe parallel image/audio decoding while strictly preserving the chronological order of user inputs, and can be used in the future to process large numbers of video frames.
+    - O(1) Prefix Matching ("Negative Reverse Vocabulary"): Replaced slow dictionary lookups with a deterministic hash-to-negative-integer mapping for media IDs. This isolates media tokens from the LLM's positive vocabulary space, enabling native, ultra-fast `longest_token_prefix` array comparisons in Python.
+    - Hybrid Model State Management: Replaced aggressive mid-turn saving with highly efficient "End-of-Turn" checkpointing. This ensures multi-image prompts consume only a single LRU slot while allowing precise rollback to the nearest valid state upon cache misses.
+    - Robust Context Shift (OOM Defense): The `__call__` loop now preemptively calculates token boundaries for upcoming multimodal chunks, safely discarding the oldest unpinned tokens from both the physical KV cache and the Python virtual ledger to prevent backend crashes.
+    - Qwen3.5 Support CONFRIMED, waiting Qwen35ChatHandler PR merge
+
+- merge: Implemented Qwen35ChatHandler for Qwen3.5(by **@alcoftTAO**)
+
+- fix: Correct the mtmd vision check condition bug
+
+- refactor(chat_handler): extract MTMDChatHandler base class and Simplify the complexity of subsequent multimodal adaptation
+    - Extracted the core multimodal processing pipeline from `Llava15ChatHandler` into a generic `MTMDChatHandler` base class, separating pipeline logic from model-specific prompt formats.
+    - Updated all multimodal subclass handlers (e.g., Gemma3,  Granite-Docling, PaddleOCR, Qwen2.5vl, Qwen3-vl, MiniCPM, GLM4.xV, LFM2-VL) to inherit from the new base class `MTMDChatHandler`.
+    - Implemented strict `**kwargs` validation in the baseconstructor to gracefully intercept and report unsupported parameters, significantly improving Developer Experience (DX).
+    - Introduced dynamic `self.log_prefix` (`self.__class__.__name__`) for accurate and consistent logging across all subclasses.
+    - Cleaned up redundant state-clearing, image-count logic and hardcoded print statements across subclass `__call__` implementations.
+    - To avoid exceptions occurring when the close method is called due to initialization failure and the call to exit_stack.
+
+- feat: Update llama.cpp to [ggml-org/llama.cpp/commit/2afcdb9777b1bac79fa4bfe284b9bf23085b0469](https://github.com/ggml-org/llama.cpp/commit/2afcdb9777b1bac79fa4bfe284b9bf23085b0469)
+
+- feat: Sync llama.cpp llama/mtmd API Binding 20260301
+
+Many thanks to **@yamikumo-DSD** and **@roj234** for providing detailed testing and valuable suggestions.
+
+More information see: https://github.com/JamePeng/llama-cpp-python/compare/e4861df5fd44bb83ec2b9063ca3375759416aead...3f8f0f89a2b72ec2f9494fa5f14206591a5cde49
+
+## [0.3.29]
+
+- perf(eval): implement adaptive checkpoint intervals for hybrid models
+    - Dynamically scale checkpoint frequency during large prompt pre-filling (max 3 triggers per eval) to minimize I/O bottlenecks and stuttering.
+    - Add success validation to `save_checkpoint`, ensuring the `last_ckpt_pos` tracker is only updated when the state is successfully saved to disk/memory.
+    - Enhance verbose logging to track dynamic interval calculations and save failures.
+
+- fix(eval): make context shift mathematically robust and architecture-safe
+    - Added a `memory_can_shift()` pre-flight check to proactively intercept and abort gracefully on architectures that physically forbid shifting (e.g., multimodal mmproj where `n_pos_per_embd > 1` or incompatible M-RoPE), preventing fatal `GGML_ASSERT` C++ crashes.
+    - Implemented dynamic mathematical bounds for `n_keep` and `n_discard` to guarantee that enough space is always freed, completely eliminating the edge-case where `n_discard` evaluates to 0 (causing a dead-loop when `n_ctx` is extremely small).
+    - Wrapped underlying C++ memory shift operations in a try-except block for defense-in-depth against unexpected backend failures.
+    - Expanded in-code documentation to clarify the arithmetic constraints and architectural limitations of the KV shift mechanism.
+
+- Add the memory_can_shift API to class LlamaContext
+
+- feat(eval): enable native context shift for hybrid/recurrent models
+    - Removed the `RuntimeError` that previously blocked context shifting for hybrid and SWA architectures.
+    - Delegated the shift logic to the underlying C++ backend, which automatically handles Attention KV removal and RNN `pos` shifting.
+    - Added dynamic verbose logging to clearly identify the model type (Transformer vs. Hybrid/Recurrent/SWA) during a context shift event.
+
+- fix(eval): prevent batch size from halving below 1 during KV slot exhaustion
+    - Added an explicit guard to break the dynamic batch downgrade loop when `current_batch_size` is exactly 1 and a Code 1 (No KV slot) is returned.
+    - Prevents the engine from executing an invalid `1 // 2` operation and generating the confusing "Halving batch size from 1 to 0" verbose log.
+    - Ensures the evaluation process fails fast and aborts gracefully when physical VRAM is completely depleted and no further fallback is mathematically possible.
+
+- feat(hybrid): add periodic checkpointing and adaptive batch handling
+    - Increase default `ctx_checkpoints` from 16 to 32
+    - Add new parameter `checkpoint_interval` (default: 4096) for hybrid model state snapshots
+    - Implement robust dynamic batch downgrade on KV cache exhaustion (status=1)
+    - Introduce periodic checkpoint saves during eval in hybrid mode
+    - Improve error handling and logging around context shifts and decoding failures
+
+- Optimization (decode): treat KV slot exhaustion (code 1) as a recoverable return value
+    - Updated the `decode` wrapper to explicitly return `1` instead of raising a `RuntimeError` when `llama_decode` indicates no KV slots are available.
+    - Aligned Python API behavior with the underlying C++ contract, treating code 1 as a recoverable signal rather than a fatal crash.
+    - Enabled upper-level caller loops (like `eval`) to gracefully handle VRAM fragmentation via dynamic batch halving without relying on clumsy try-except block string parsing.
+    - Retained strict `RuntimeError` exceptions for truly fatal backend failures (e.g., codes -1, -2, -3).
+    - Added comprehensive docstrings detailing return codes and exception scenarios.
+
+- feat(core): overhaul generate and eval for hybrid model support(Qwen3-next、Qwen3.5 etc.)
+    - Integrated `HybridCheckpointCache` into the generation loop to support state rollback for recurrent/hybrid architectures.
+    - Implemented Context Shift (sliding window) in `eval` to gracefully prevent OOM when exceeding `n_ctx`.
+    - Adapted `eval` to use the newly vectorized `LlamaBatch.add_sequence` API with dynamic `logits_array` configuration.
+    - Fixed the full prefix match bug by forcing a 1-token re-evaluation to refresh logits.
+    - Disabled speculative decoding for hybrid models to prevent irreversible state pollution.
+    - Wrapped the generation loop in a `try...finally` block to guarantee safe checkpoint saving.
+
+- refactor(LlamaBatch): replace set_batch with granular add_token + vectorized add_sequence
+    - Introduce high-performance add_token() for single-token append in generation loop
+    - Add flexible add_sequence() with per-token pos/seq_ids/logits arrays
+    - Remove old set_batch() that assumed single-seq + forced last logit
+    - Better support for multi-sequence and precise logit control
+
+## [0.3.28]
+
+- fix(HybridCheckpointCache): ValueError: bytes must be in range(0, 256)
+
+- feat: add HybridCheckpointCache detect support for recurrent/hybrid/SWA models
+    - Introduce ctx_checkpoints parameter (default 16)
+    - Detect recurrent / hybrid / n_swa > 0 models in __init__
+    - Automatically use HybridCheckpointCache when hybrid architecture is detected
+    - Properly close and clear HybridCheckpointCache in __del__
+
+- fix(cache): add safety guards to checkpoint restore and optimize API calls
+    - Replaced direct `llama_cpp` API calls with cached function pointers (`self._get_size_ext`, etc.) for better performance and consistency.
+    - Added sequence ID validation with verbose error logging to prevent cross-sequence contamination.
+    - Added strict state size validation before restoration to prevent buffer overflows and backend segmentation faults.
+
+- Remove redundant seq_id and add resource cleanup
+    - Removed `seq_id` from `HybridCheckpointCache` initialization to make it a stateless, global multi-sequence manager.
+    - Added `close()` and `__del__()` methods to safely release C++ context references and prevent memory leaks.
+
+- feat(cache): implement HybridCheckpointCache for hybrid/recurrent models
+Introduces a dedicated caching mechanism to support state rollback for
+models that cannot physically truncate their KV cache (e.g., Qwen3-Next, Qwen3.5,
+etc.).
+
+    Key additions and changes:
+    - Add `HybridCheckpoint` dataclass to store RNN state snapshots along with their binary data and metadata.
+    - Implement `HybridCheckpointCache` to manage sequence-specific states using the `llama_state_seq_*_ext` C++ APIs.
+    - Introduce `_hash_prefix` using SHA-256 to guarantee cryptographic certainty when matching prompt histories, preventing state corruption.
+    - Add `save_checkpoint` with a FIFO eviction policy to strictly bound memory usage based on `max_checkpoints`.
+    - Add `restore_checkpoint` to securely inject valid RNN states back into the C++ backend.
+    - Explicitly disable incompatible dictionary interfaces (`__getitem__`, `__setitem__`, `__contains__`) inherited from `BaseLlamaCache`.
+    - Refactor module imports (alphabetical sorting) and relocate `LlamaDiskCache` for better structural consistency.
+
+- Remove the hack code in llama_chat_format.py
+
+- LLama: Optimize KV cache management for multi-round conversations
+    - Implements prefix-matching logic to truncate stale "ghost" tokens in C++ KV cache
+    - Prevents attention misalignment and context poisoning during multi-turn interactions
+    - Reduces memory overhead by reusing matched prefixes efficiently
+
 ## [0.3.27]
 
 - feat: add `PaddleOCR-VL-1.5` multimodal chat handler `PaddleOCRChatHandler`

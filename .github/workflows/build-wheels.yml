@@ -60,7 +60,7 @@ jobs:
       # Jimver/cuda-toolkit installs NVCC, cuBLAS, cuDNN headers etc.
       # Docs: https://github.com/Jimver/cuda-toolkit
       - name: Install CUDA 12.8 Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: '12.8.0'
@@ -74,7 +74,7 @@ jobs:
 
       - name: Build wheel
         env:
-          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
+          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDAARCHS }}"
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
         run: pip wheel . -w dist --no-deps --verbose
 
@@ -131,7 +131,7 @@ jobs:
 
       - name: Build wheel
         env:
-          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
+          CMAKE_ARGS: "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDAARCHS }}"
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
           LD_LIBRARY_PATH: "/usr/local/cuda-12.8/lib64"
         run: |
@@ -171,6 +171,9 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:

@@ -75,8 +75,10 @@ class LlamaModel:
         self.model = model
         self.vocab = vocab
 
+        self._lora_registry: Dict[str, LlamaLoraAdapter] = {}
+
     def close(self):
-        """Manually free LlamaModel and Vocab resources."""
+        """Manually free LlamaModel and Vocab/Lora resources."""
         if getattr(self, "model", None) is not None:
             try:
                 llama_cpp.llama_model_free(self.model)
@@ -85,7 +87,13 @@ class LlamaModel:
             self.model = None
         self.vocab = None
 
-        self._exit_stack.close()
+        if hasattr(self, "_lora_registry") and self._lora_registry:
+            self.unload_all_loras()
+            self._lora_registry = None
+
+        if getattr(self, "_exit_stack", None) is not None and hasattr(self._exit_stack, "close"):
+            self._exit_stack.close()
+            self._exit_stack = None
 
     def __del__(self):
         self.close()
@@ -309,8 +317,62 @@ class LlamaModel:
 
         return bytes(buffer[:n_chars])
 
+    # Lora
+
+    def load_lora(self, name: str, path: str):
+        """Loads a LoRA adapter into VRAM without applying it yet."""
+        # Skip if it's already loaded
+        if name in self._lora_registry:
+            return
+
+        adapter = LlamaLoraAdapter(self.model, path)
+        self._lora_registry[name] = adapter
+
+        self._exit_stack.callback(adapter.free)
+
+        if self.verbose:
+            print(f"Loaded LoRA '{name}' into memory.")
+
+    def unload_lora(self, name: str):
+        """Actively unloads a specific LoRA to free up VRAM."""
+        if name in self._lora_registry:
+            adapter = self._lora_registry.pop(name)
+            adapter.free()
+            if self.verbose:
+                print(f"Unloaded LoRA '{name}' and freed memory.")
+
+    @property
+    def loaded_lora_count(self) -> int:
+        """
+        Returns the total number of LoRA adapters currently loaded in VRAM.
+        """
+        return len(self._lora_registry)
+
+    def list_loras(self) -> List[str]:
+        """
+        Returns a list of all registered LoRA names.
+        """
+        return list(self._lora_registry.keys())
+
+    def unload_all_loras(self):
+        """
+        Iterates through the registry and forces VRAM release for all loaded LoRAs.
+        """
+        if not self._lora_registry:
+            return
+
+        # Cast keys to a list first to avoid RuntimeError:
+        # 'dictionary changed size during iteration' when pop() is called inside unload_lora.
+        loaded_names = list(self._lora_registry.keys())
+
+        for name in loaded_names:
+            self.unload_lora(name)
+
+        if self.verbose:
+            print(f"Successfully unloaded all {len(loaded_names)} LoRA adapters and cleared the registry.")
 
     # Extra
+
     def metadata(self) -> Dict[str, str]:
         metadata: Dict[str, str] = {}
         # Pre-allocate a 16KB buffer. This is large enough to handle almost all
@@ -354,6 +416,61 @@ class LlamaModel:
         return llama_cpp.llama_model_default_params()
 
 
+class LlamaLoraAdapter:
+    """Wrapper for llama_adapter_lora_p to safely manage C++ memory lifecycle."""
+    def __init__(self, model: llama_cpp.llama_model_p, path: str):
+        """
+        Initializes and loads the LoRA adapter into memory.
+
+        Args:
+            model: The pointer to the base Llama model.
+            path: The file path to the LoRA adapter (.gguf).
+        """
+        self.path = path
+        # Load the LoRA adapter from file into memory via llama.cpp API
+        # Note: The path string must be encoded to UTF-8 bytes for ctypes compatibility.
+        self.adapter = llama_cpp.llama_adapter_lora_init(
+            model,
+            path.encode("utf-8")
+        )
+        if not self.adapter:
+            raise RuntimeError(f"Failed to load LoRA from {path}")
+
+    def free(self):
+        """
+        Explicitly frees the underlying C++ memory allocated for the LoRA adapter.
+        Should be called when the adapter is actively unloaded to instantly release VRAM.
+        """
+        # Check if the adapter exists and hasn't been freed yet
+        if getattr(self, "adapter", None) is not None:
+            llama_cpp.llama_adapter_lora_free(self.adapter)
+            self.adapter = None
+        self.path = None
+
+    def __del__(self):
+        self.free()
+
+    @property
+    def alora_invocation_tokens(self) -> List[int]:
+        """
+        Retrieves the list of invocation (trigger) tokens if this adapter is an ALoRA (Activation LoRA).
+        Returns an empty list for standard LoRA adapters.
+        """
+        if getattr(self, "adapter", None) is None:
+            return []
+
+        # 1. Query the C++ backend for the exact number of trigger tokens
+        n_tokens = llama_cpp.llama_adapter_get_alora_n_invocation_tokens(self.adapter)
+        if n_tokens == 0:
+            return []
+
+        # 2. Retrieve the underlying C pointer to the contiguous array of tokens
+        tokens_ptr = llama_cpp.llama_adapter_get_alora_invocation_tokens(self.adapter)
+
+        # 3. Safely iterate through the C memory block and convert it into a native Python list
+        return [tokens_ptr[i] for i in range(n_tokens)]
+
+
 class LlamaContext:
     """Intermediate Python wrapper for a llama.cpp llama_context.
     NOTE: For stability it's recommended you use the Llama class instead."""
@@ -378,6 +495,9 @@ class LlamaContext:
 
         self.ctx = ctx
 
+        self._loras_applied: bool = False
+        self._cvec_applied: bool = False
+
     def close(self):
         """Manually free LlamaContext resources."""
         if getattr(self, "ctx", None) is not None:
@@ -386,8 +506,11 @@ class LlamaContext:
             except Exception:
                 pass
             self.ctx = None
+        self.params = None
 
-        self._exit_stack.close()
+        if getattr(self, "_exit_stack", None) is not None and hasattr(self._exit_stack, "close"):
+            self._exit_stack.close()
+            self._exit_stack = None
 
     def __del__(self):
         self.close()
@@ -441,6 +564,9 @@ class LlamaContext:
 
     def memory_seq_pos_min(self, seq_id: int) -> int:
         return llama_cpp.llama_memory_seq_pos_min(self.get_memory(), seq_id)
+
+    def memory_can_shift(self) -> bool:
+        return llama_cpp.llama_memory_can_shift(self.get_memory())
 
     # // State / sessions API
 
@@ -529,37 +655,83 @@ class LlamaContext:
         if return_code != 0:
             raise RuntimeError(f"llama_encode returned {return_code}")
 
-    def decode(self, batch: LlamaBatch):
+    def decode(self, batch: 'LlamaBatch') -> int:
+        """
+        Evaluate the batch of tokens using the transformer model.
+
+        This method executes the forward pass. If the KV cache is heavily fragmented
+        or out of space, it may return 1, indicating the caller should try to reduce
+        the batch size or evict idle sequences.
+
+        Returns:
+            0: Success.
+            1: No KV slot available (Recoverable). The caller should implement a
+               fallback strategy, such as reducing the batch size and retrying.
+
+        Raises:
+            RuntimeError: If a fatal, non-recoverable error occurs during decoding
+                          (e.g., negative error codes or invalid batch structures).
+        """
         return_code = llama_cpp.llama_decode(self.ctx, batch.batch)
 
         if return_code == 0:
-            return
+            return 0
 
+        # 1 means "No KV slot available".
+        # We explicitly return 1 instead of raising an exception so that the caller
+        # can gracefully handle it via dynamic batch sizing (batch_size //= 2).
+        elif return_code == 1:
+            return 1
+
+        # Any other code indicates a fatal failure.
         error_map = {
-             1: "No KV slot available: try reducing batch size or increasing context window",
-             2: "Decoding aborted",
-            -1: "Invalid input batch",
+             2: "Decoding aborted by user callback",
+            -1: "Invalid input batch (e.g. n_tokens == 0 or exceeding capacity)",
+            -2: "Could not allocate space for the compute graph (VRAM exhausted)",
+            -3: "Graph computation failed internally",
         }
 
-        msg = error_map.get(return_code, "Fatal internal error")
+        msg = error_map.get(return_code, "Unknown fatal internal error")
         raise RuntimeError(f"llama_decode failed (code {return_code}): {msg}")
 
     def set_n_threads(self, n_threads: int, n_threads_batch: int):
+        """
+        Set the number of threads used for decoding
+
+        Args:
+            n_threads: the number of threads used for generation (single token)
+            n_threads_batch: the number of threads used for prompt and batch processing (multiple tokens)
+        """
         llama_cpp.llama_set_n_threads(self.ctx, n_threads, n_threads_batch)
 
     def n_threads(self) -> int:
+        """Get the number of threads used for generation of a single token."""
         return llama_cpp.llama_n_threads(self.ctx)
 
     def n_threads_batch(self) -> int:
+        """Get the number of threads used for prompt and batch processing (multiple token)."""
         return llama_cpp.llama_n_threads_batch(self.ctx)
 
     def set_causal_attn(self, causal_attn: bool):
+        """
+        Set whether to use causal attention or not
+        If set to true, the model will only attend to the past tokens
+        """
         llama_cpp.llama_set_causal_attn(self.ctx, causal_attn)
 
     def set_warmup(self, warmup: bool):
+        """
+        Set whether the model is in warmup mode or not
+        If true, all model tensors are activated during llama_decode() to load and cache their weights.
+        """
         llama_cpp.llama_set_warmup(self.ctx, warmup)
 
     def synchronize(self):
+        """
+        Wait until all computations are finished
+        This is automatically done when using one of the functions below to obtain the computation results
+        and is not necessary to call it explicitly in most cases
+        """
         llama_cpp.llama_synchronize(self.ctx)
 
     def get_logits(self):
@@ -611,10 +783,135 @@ class LlamaContext:
     def print_timings(self):
         llama_cpp.llama_perf_context_print(self.ctx)
 
-    def print_memory_breakdown(self):
-        llama_cpp.llama_memory_breakdown_print(self.ctx)
+    # LoRA / ALoRA Dynamic Routing Methods
+
+    def clear_loras(self):
+        """
+        Clears all currently applied LoRA weights from the context.
+        Restores the computational graph to the base model state.
+        """
+        if not self._loras_applied:
+            return
+        llama_cpp.llama_set_adapters_lora(self.ctx, None, 0, None)
+        self._loras_applied = False
+
+    def apply_loras(self, active_loras: List[Tuple["LlamaLoraAdapter", float]]):
+        """
+        Dynamically mounts a combination of LoRAs and their scales to the current context.
+        This must be called immediately before evaluating/decoding the computation graph.
+
+        Args:
+            active_loras: A list of tuples containing (LlamaLoraAdapter instance, scale float).
+        """
+        # If no LoRAs are requested, ensure the context is wiped clean to prevent contamination
+        if not active_loras:
+            self.clear_loras()
+            return
+
+        n_adapters = len(active_loras)
+
+        # 1. Dynamically construct contiguous C-array types required by the C++ backend
+        AdapterArrayType = llama_cpp.llama_adapter_lora_p_ctypes * n_adapters
+        ScaleArrayType = ctypes.c_float * n_adapters
+
+        # 2. Instantiate the arrays in memory
+        c_adapters = AdapterArrayType()
+        c_scales = ScaleArrayType()
+
+        # 3. Populate the C-arrays with the underlying adapter pointers and float scales
+        for i, (adapter_obj, scale) in enumerate(active_loras):
+            c_adapters[i] = adapter_obj.adapter
+            c_scales[i] = scale
+
+        # 4. Atomically apply the requested adapters to the computation graph
+        ret = llama_cpp.llama_set_adapters_lora(
+            self.ctx,
+            c_adapters,
+            n_adapters,
+            c_scales
+        )
+
+        if ret != 0:
+            raise RuntimeError("LlamaContext(apply_loras): Failed to set LoRA adapters dynamically.")
+
+        self._loras_applied = True
+
+        if self.verbose:
+            print(f"LlamaContext(apply_loras): Successfully applied {n_adapters} LoRA adapter(s) to the compute graph.")
+
+    # Control Vector (CVec) Methods
+
+    def clear_cvec(self):
+        """
+        Clears the currently loaded control vector from the context.
+        Passing NULL (None) and zeros safely resets the graph.
+        """
+        if not self._cvec_applied:
+            return
+        llama_cpp.llama_set_adapter_cvec(self.ctx, None, 0, 0, 0, 0)
+        self._cvec_applied = False
+
+    def apply_cvec(self, data: List[float], n_embd: int, il_start: int, il_end: int):
+        """
+        Dynamically applies a Control Vector (CVec) to the specified layer range.
+
+        Args:
+            data: Flattened 1D list of floats.
+                  [CRITICAL_LAYOUT_RULE]: Based on llama.cpp source, the data buffer
+                  is strictly mapped starting from Layer 1. Even if il_start > 1,
+                  the `data` array must contain zero-padding for the skipped early layers.
+                  Total length MUST be >= n_embd * il_end.
+            n_embd: The embedding dimension of the model.
+            il_start: The starting layer to apply the vector (inclusive, 1-indexed).
+            il_end: The ending layer to apply the vector (inclusive).
+        """
+        if not data:
+            self.clear_cvec()
+            return
+
+        length = len(data)
+
+        # Strictly validate length based on C++ buffer mapping rules
+        # The C++ backend uses offset: off = n_embd * (il - 1).
+        # To successfully write up to il_end, the buffer length must be at least n_embd * il_end.
+        minimum_required_len = n_embd * il_end
+        if length < minimum_required_len:
+            raise ValueError(
+                f"LlamaContext(apply_cvec): "
+                f"[Memory Layout Error] Control vector data length ({length}) is too short. "
+                f"llama.cpp requires the buffer to map continuously from Layer 1. "
+                f"To apply up to layer {il_end}, length must be at least {minimum_required_len}."
+            )
+
+        # 1. Convert to C Array
+        CFloatArrayType = ctypes.c_float * length
+        c_data = CFloatArrayType(*data)
+
+        # 2. Inject into graph
+        ret = llama_cpp.llama_set_adapter_cvec(
+            self.ctx,
+            c_data,
+            length,
+            n_embd,
+            il_start,
+            il_end
+        )
+
+        # 3. Handle specific C++ boolean false (converted to -1)
+        if ret != 0:
+            raise RuntimeError(
+                f"LlamaContext(apply_cvec): "
+                f"C++ backend rejected the Control Vector. "
+                f"Usually indicates n_embd ({n_embd}) does not match the model's actual embedding dimension."
+            )
+
+        self._cvec_applied = True
+
+        if self.verbose:
+            print(f"LlamaContext(apply_cvec): Applied Control Vector to layers {il_start}-{il_end} (Buffer size matched C++ layout).")
 
     # Utility functions
+
     @staticmethod
     def default_params():
         """Get the default llama_context_params."""
@@ -660,7 +957,9 @@ class LlamaBatch:
                 pass
             self.batch = None
 
-        self._exit_stack.close()
+        if getattr(self, "_exit_stack", None) is not None and hasattr(self._exit_stack, "close"):
+            self._exit_stack.close()
+            self._exit_stack = None
 
     def __del__(self):
         self.close()
@@ -700,37 +999,82 @@ class LlamaBatch:
         if self.batch is not None:
             self.batch.n_tokens = 0
 
-    def set_batch(self, batch: Sequence[int], n_past: llama_cpp.llama_pos, logits_all: bool):
-        if len(batch) > self.n_tokens_capacity:
-             raise IndexError(f"Input batch size {len(batch)} exceeds capacity {self.n_tokens_capacity}")
+    def add_token(self, token: int, pos: int, seq_ids: Sequence[int], logits: bool):
+        """
+        Adds a single token to the batch.
+        This is a high-performance method for appending a single token during the generation loop,
+        avoiding the overhead of creating temporary lists required by add_sequence.
 
-        n_tokens = len(batch)
-        self.batch.n_tokens = n_tokens
-        for i in range(n_tokens):
-            self.batch.token[i] = batch[i]
-            self.batch.pos[i] = n_past + i
-            self.batch.seq_id[i][0] = 0
-            self.batch.n_seq_id[i] = 1
-            self.batch.logits[i] = logits_all
-        self.batch.logits[n_tokens - 1] = True
+        Args:
+            token: The integer ID of the token to add.
+            pos: The logical sequence position (n_past) of this token.
+            seq_ids: A sequence of sequence IDs this token belongs to (e.g., [0] for a standard single chat).
+                     A single token can be part of multiple sequences simultaneously.
+            logits: A boolean flag indicating whether the backend should compute logits for this token.
+        """
+        idx = self.batch.n_tokens
+        if idx >= self.n_tokens_capacity:
+            raise IndexError(f"LlamaBatch overflow[add_token]: Cannot add token. Capacity {self.n_tokens_capacity} reached.")
 
-    def add_sequence(self, batch: Sequence[int], seq_id: int, logits_all: bool):
-        n_tokens = len(batch)
+        self.batch.token[idx] = token
+        self.batch.pos[idx] = pos
+
+        n_seq_id = len(seq_ids)
+        if n_seq_id > self.n_seq_max:
+            raise ValueError(f"LlamaBatch Error[add_token]: Token belongs to {n_seq_id} sequences, "
+                             f"but n_seq_max was initialized to {self.n_seq_max}.")
+        self.batch.n_seq_id[idx] = n_seq_id
+
+        for i, seq_id in enumerate(seq_ids):
+            self.batch.seq_id[idx][i] = seq_id
+        self.batch.logits[idx] = logits
+
+        self.batch.n_tokens += 1
+
+    def add_sequence(
+        self,
+        token_array: Sequence[int],
+        pos_array: Sequence[int],
+        seq_ids: Sequence[Sequence[int]],
+        logits_array: Sequence[bool]
+    ):
+        """
+        Adds a sequence of tokens to the batch in a vectorized manner.
+        Strictly maps the provided arrays to the underlying C++ batch structure without subjective overriding.
+
+        Args:
+            token_array: A sequence of token IDs to be evaluated.
+            pos_array: A sequence of logical positions corresponding to each token.
+            seq_id_array: A sequence of lists, where each list contains the sequence IDs for the respective token.
+                          (e.g., [[0], [0], [0]] for 3 tokens belonging to sequence 0).
+            logits_array: A sequence of boolean flags indicating whether to compute logits for each token.
+        """
+        n_tokens = len(token_array)
         current_count = self.batch.n_tokens
+
         if current_count + n_tokens > self.n_tokens_capacity:
             raise IndexError(
-                f"LlamaBatch overflow: Cannot add {n_tokens} tokens. "
+                f"LlamaBatch overflow[add_sequence]: Cannot add {n_tokens} tokens. "
                 f"Space left: {self.n_tokens_capacity - current_count}"
             )
-        self.batch.n_tokens += n_tokens
+
+        n_seq_id = len(seq_ids)
+        if n_seq_id > self.n_seq_max:
+            raise ValueError(f"LlamaBatch Error[add_sequence]: Token belongs to {n_seq_id} sequences, "
+                             f"but n_seq_max was initialized to {self.n_seq_max}.")
+
         for i in range(n_tokens):
             j = current_count + i
-            self.batch.token[j] = batch[i]
-            self.batch.pos[j] = i
-            self.batch.seq_id[j][0] = seq_id
-            self.batch.n_seq_id[j] = 1
-            self.batch.logits[j] = logits_all
-        self.batch.logits[current_count + n_tokens - 1] = True
+            self.batch.token[j] = token_array[i]
+            self.batch.pos[j] = pos_array[i]
+
+            self.batch.n_seq_id[j] = n_seq_id
+            for k, seq_id in enumerate(seq_ids):
+                self.batch.seq_id[j][k] = seq_id
+
+            self.batch.logits[j] = logits_array[i]
+
+        self.batch.n_tokens += n_tokens
 
 
 # Embedding functions
@@ -1045,6 +1389,7 @@ class LlamaSamplingContext:
 
         # reusable numpy logits view
         self._logits_view = None
+        self._logits_ptr_addr = None
 
         self._single_token = llama_cpp.llama_token_data()
         self._single_array = llama_cpp.llama_token_data_array(
@@ -1227,12 +1572,14 @@ class LlamaSamplingContext:
 
         # 3. build cur_p
         logits_ptr = llama_cpp.llama_get_logits_ith(ctx.ctx, idx)
+        cur_addr = ctypes.addressof(logits_ptr.contents)
 
-        if self._logits_view is None:
+        if self._logits_ptr_addr != cur_addr:
             self._logits_view = np.ctypeslib.as_array(
                 logits_ptr,
                 shape=(self.n_vocab,),
             )
+            self._logits_ptr_addr = cur_addr
 
         logits_array = self._logits_view
         cur_p = self._cur_p
@@ -1341,6 +1688,7 @@ class LlamaSamplingContext:
 
         # Remove NumPy view pointing to llama logits buffer.
         self._logits_view = None
+        self._logits_ptr_addr = None
 
         # Break references to small C structs used in grammar rejection sampling.
         self._single_token = None

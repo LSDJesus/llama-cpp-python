@@ -62,6 +62,9 @@ all = [
     "llama_cpp_python[server,test,dev]",
 ]
 
+[tool.cmake.define]
+GGML_CUDA = "on"
+
 [tool.scikit-build]
 wheel.packages = ["llama_cpp"]
 wheel.py-api = "cp39"   # ABI3: one wheel per platform, works on Python 3.9+

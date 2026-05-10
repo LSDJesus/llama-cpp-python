@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import fnmatch
+import json
+import multiprocessing
 import os
 import sys
-import uuid
 import time
-import json
-import ctypes
+import threading
 import typing
-import random
-import fnmatch
+import uuid
 import warnings
-import contextlib
-import multiprocessing
+
+import numpy as np
+import numpy.typing as npt
 
 from typing import (
     Any,
@@ -29,24 +32,21 @@ from typing import (
 from collections import deque
 from pathlib import Path
 
-
 from .llama_types import *
 from .llama_grammar import LlamaGrammar
 from .llama_cache import (
     BaseLlamaCache,
-    LlamaCache,      # type: ignore
-    LlamaDiskCache,  # type: ignore
-    LlamaRAMCache,   # type: ignore
-    LlamaTrieCache,  # type: ignore
+    LlamaCache,            # type: ignore
+    LlamaDiskCache,        # type: ignore
+    LlamaRAMCache,         # type: ignore
+    LlamaTrieCache,        # type: ignore
+    HybridCheckpointCache, # type: ignore
 )
 from .llama_tokenizer import BaseLlamaTokenizer, LlamaTokenizer
-import llama_cpp.llama_cpp as llama_cpp
+import llama_cpp.llama_cpp as llama_cpp_lib
 import llama_cpp.llama_chat_format as llama_chat_format
 
 from llama_cpp.llama_speculative import LlamaDraftModel
-
-import numpy as np
-import numpy.typing as npt
 
 import llama_cpp._internals as internals
 from ._internals import (
@@ -55,8 +55,24 @@ from ._internals import (
     CommonSamplerType,
     CustomSampler,
 )
+from ._ggml import (
+    ggml_backend_cpu_buffer_type,
+)
 from ._logger import set_verbose
 from ._utils import suppress_stdout_stderr
+
+
+class AbortCriteria:
+    """
+    Listen for external interruption signals to trigger a stop condition.
+    When an external thread calls `llama.abort()`, a loop interrupt is generated.
+    """
+    def __init__(self, abort_event: threading.Event):
+        self.abort_event = abort_event
+
+    def __call__(self, _input_ids: npt.NDArray[np.intc], _logits: npt.NDArray[np.single]) -> bool:
+        # Note: _input_ids and _logits are required by the signature but unused here.
+        return self.abort_event.is_set()
 
 
 class Llama:
@@ -64,13 +80,17 @@ class Llama:
 
     __backend_initialized = False
 
+    LLM_FFN_EXPS_REGEX = rb"\.ffn_(up|down|gate|gate_up)_(ch|)exps"
+
     def __init__(
         self,
         model_path: str,
         *,
         # Model Params
-        n_gpu_layers: int = 0,
-        split_mode: int = llama_cpp.LLAMA_SPLIT_MODE_LAYER,
+        n_gpu_layers: Union[int, Literal["auto", "all"]] = "auto",
+        cpu_moe: bool = False,
+        n_cpu_moe: int = 0,
+        split_mode: int = llama_cpp_lib.llama_split_mode.LLAMA_SPLIT_MODE_LAYER,
         main_gpu: int = 0,
         tensor_split: Optional[List[float]] = None,
         vocab_only: bool = False,
@@ -80,10 +100,12 @@ class Llama:
         check_tensors: bool = False,
         use_extra_bufts: bool = False,
         no_host: bool = False,
+        skip_output_head: bool = False,
         kv_overrides: Optional[Dict[str, Union[bool, int, float, str]]] = None,
         # Context Params
-        seed: int = llama_cpp.LLAMA_DEFAULT_SEED,
+        seed: int = llama_cpp_lib.LLAMA_DEFAULT_SEED,
         n_ctx: int = 512,
+        n_keep: int = 256,
         n_batch: int = 2048,
         n_ubatch: int = 512,
         n_seq_max: int = 1,
@@ -91,10 +113,10 @@ class Llama:
         n_threads_batch: Optional[int] = None,
         rope_scaling_type: Optional[
             int
-        ] = llama_cpp.llama_rope_scaling_type.LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
-        pooling_type: int = llama_cpp.LLAMA_POOLING_TYPE_UNSPECIFIED,
-        attention_type: Optional[int] = llama_cpp.llama_attention_type.LLAMA_ATTENTION_TYPE_UNSPECIFIED,
-        flash_attn_type: Optional[int] = llama_cpp.llama_flash_attn_type.LLAMA_FLASH_ATTN_TYPE_AUTO,
+        ] = llama_cpp_lib.llama_rope_scaling_type.LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
+        pooling_type: int = llama_cpp_lib.LLAMA_POOLING_TYPE_UNSPECIFIED,
+        attention_type: Optional[int] = llama_cpp_lib.llama_attention_type.LLAMA_ATTENTION_TYPE_UNSPECIFIED,
+        flash_attn_type: Optional[int] = llama_cpp_lib.llama_flash_attn_type.LLAMA_FLASH_ATTN_TYPE_AUTO,
         rope_freq_base: float = 0.0,
         rope_freq_scale: float = 0.0,
         yarn_ext_factor: float = -1.0,
@@ -109,12 +131,11 @@ class Llama:
         op_offload: Optional[bool] = None,
         swa_full: Optional[bool] = None,
         kv_unified: Optional[bool] = None,
+        # HybridCheckpointCache Params
+        ctx_checkpoints: int = 32,
+        checkpoint_interval: int = 4096,
         # Sampling Params
         last_n_tokens_size: int = 64,
-        # LoRA Params
-        lora_base: Optional[str] = None,
-        lora_scale: float = 1.0,
-        lora_path: Optional[str] = None,
         # Backend Params
         numa: Union[bool, int] = False,
         # Chat Format Params
@@ -161,7 +182,14 @@ class Llama:
 
         Args:
             model_path: Path to the model.
-            n_gpu_layers: Number of layers to offload to GPU (-ngl). If -1, all layers are offloaded.
+            n_gpu_layers: Max number of model layers to store in VRAM (-ngl).
+                Accepts an exact integer, "auto", or "all".
+                "auto" / -1 lets llama.cpp choose automatically.
+                "all" / -2 stores all possible layers in VRAM.
+                0 disables model layer offload.
+            cpu_moe: Keep all Mixture of Experts (MoE) weights in the CPU
+            n_cpu_moe: Keep the MoE expert weights of the first N layers on CPU.
+                Useful when VRAM is insufficient for MoE models.
             split_mode: How to split the model across GPUs. See llama_cpp.LLAMA_SPLIT_* for options.
             main_gpu: main_gpu interpretation depends on split_mode: LLAMA_SPLIT_MODE_NONE: the GPU that is used for the entire model. LLAMA_SPLIT_MODE_ROW: the GPU that is used for small tensors and intermediate results. LLAMA_SPLIT_MODE_LAYER: ignored
             tensor_split: How split tensors should be distributed across GPUs. If None, the model is not split.
@@ -171,9 +199,11 @@ class Llama:
             check_tensors: validate model tensor data
             use_extra_bufts: use extra buffer types (used for weight repacking)
             no_host: bypass host buffer allowing extra buffers to be used
+            skip_output_head: [Luna] skip loading output.weight (lm_head) to save VRAM in embedding-only mode
             kv_overrides: Key-value overrides for the model.
             seed: RNG seed, -1 for random
             n_ctx: Text context, 0 = from model
+            n_keep: Number of tokens to keep from initial prompt
             n_batch: Prompt processing maximum batch size
             n_ubatch: Physical batch size
             n_seq_max: max number of sequences (i.e. distinct states for recurrent models)
@@ -197,9 +227,9 @@ class Llama:
             op_offload: whether to offload host tensor operations to device
             swa_full: whether to use full-size SWA cache
             kv_unified: use single unified KV buffer for the KV cache of all sequences
+            ctx_checkpoints: max number of context checkpoints to create per slot (default: 16)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)
+            checkpoint_interval: Hybrid model checkpoint token intervals, and archiving of text with interval sizes along the way.
             last_n_tokens_size: Maximum number of tokens to keep in the last_n_tokens deque.
-            lora_base: Optional path to base model, useful if using a quantized base model and you want to apply LoRA to an f16 model.
-            lora_path: Path to a LoRA file to apply to the model.
             numa: numa policy
             chat_format: String specifying the chat format to use when calling create_chat_completion.
             chat_handler: Optional chat handler to use when calling create_chat_completion.
@@ -223,51 +253,98 @@ class Llama:
 
         if not Llama.__backend_initialized:
             with suppress_stdout_stderr(disable=verbose):
-                llama_cpp.llama_backend_init()
+                llama_cpp_lib.llama_backend_init()
             Llama.__backend_initialized = True
 
         if isinstance(numa, bool):
             self.numa = (
-                llama_cpp.GGML_NUMA_STRATEGY_DISTRIBUTE
+                llama_cpp_lib.GGML_NUMA_STRATEGY_DISTRIBUTE
                 if numa
-                else llama_cpp.GGML_NUMA_STRATEGY_DISABLED
+                else llama_cpp_lib.GGML_NUMA_STRATEGY_DISABLED
             )
         else:
             self.numa = numa
 
-        if self.numa != llama_cpp.GGML_NUMA_STRATEGY_DISABLED:
+        if self.numa != llama_cpp_lib.GGML_NUMA_STRATEGY_DISABLED:
             with suppress_stdout_stderr(disable=verbose):
-                llama_cpp.llama_numa_init(self.numa)
+                llama_cpp_lib.llama_numa_init(self.numa)
 
         self.model_path = model_path
 
         # Model Params
-        self.model_params = llama_cpp.llama_model_default_params()
-        self.model_params.n_gpu_layers = (
-            0x7FFFFFFF if n_gpu_layers == -1 else n_gpu_layers
-        )  # 0x7FFFFFFF is INT32 max, will be auto set to all layers
+        self.model_params = llama_cpp_lib.llama_model_default_params()
+        self.model_params.n_gpu_layers = self._parse_n_gpu_layers(n_gpu_layers)
         self.model_params.split_mode = split_mode
         self.model_params.main_gpu = main_gpu
         self.tensor_split = tensor_split
         self._c_tensor_split = None
         if self.tensor_split is not None:
-            if len(self.tensor_split) > llama_cpp.LLAMA_MAX_DEVICES:
+            if len(self.tensor_split) > llama_cpp_lib.LLAMA_MAX_DEVICES:
                 raise ValueError(
-                    f"Attempt to split tensors that exceed maximum supported devices. Current LLAMA_MAX_DEVICES={llama_cpp.LLAMA_MAX_DEVICES}"
+                    f"Attempt to split tensors that exceed maximum supported devices. Current LLAMA_MAX_DEVICES={llama_cpp_lib.LLAMA_MAX_DEVICES}"
                 )
             # Type conversion and expand the list to the length of LLAMA_MAX_DEVICES
-            FloatArray = ctypes.c_float * llama_cpp.LLAMA_MAX_DEVICES
+            FloatArray = ctypes.c_float * llama_cpp_lib.LLAMA_MAX_DEVICES
             self._c_tensor_split = FloatArray(
                 *tensor_split  # type: ignore
             )  # keep a reference to the array so it is not gc'd
             self.model_params.tensor_split = self._c_tensor_split
         self.model_params.vocab_only = vocab_only
-        self.model_params.use_mmap = use_mmap if lora_path is None else False
+        self.model_params.use_mmap = use_mmap
         self.model_params.use_direct_io = use_direct_io
         self.model_params.use_mlock = use_mlock
         self.model_params.check_tensors = check_tensors
         self.model_params.use_extra_bufts = use_extra_bufts
         self.model_params.no_host = no_host
+        self.model_params.skip_output_head = skip_output_head
+
+        # Logic of cpu_moe, n_cpu_moe
+        # Reference from llama.cpp/tools/llama-bench/llama-bench.cpp
+        self.cpu_moe = cpu_moe
+        self.n_cpu_moe = n_cpu_moe
+        self._cpu_moe_patterns = None
+        self._cpu_moe_tensor_buft_overrides = None
+
+        if self.n_cpu_moe < 0:
+            raise ValueError("n_cpu_moe must be >= 0")
+
+        if self.cpu_moe and self.n_cpu_moe != 0 and self.verbose:
+            print(
+                "Llama.__init__: cpu_moe=True already keeps all MoE expert weights on CPU; "
+                "n_cpu_moe is redundant.",
+                file=sys.stderr,
+            )
+
+        if self.cpu_moe or self.n_cpu_moe > 0:
+            cpu_buft = ggml_backend_cpu_buffer_type()
+
+            if self.cpu_moe:
+                patterns = [self.LLM_FFN_EXPS_REGEX]
+            else:
+                patterns = [
+                    self._make_cpu_moe_pattern(i)
+                    for i in range(self.n_cpu_moe)
+                ]
+
+            # keep pattern bytes alive
+            self._cpu_moe_patterns = patterns
+
+            TensorBuftOverrideArray = (
+                llama_cpp_lib.llama_model_tensor_buft_override
+                * (len(patterns) + 1)
+            )
+            self._cpu_moe_tensor_buft_overrides = TensorBuftOverrideArray()
+
+            for i, pattern in enumerate(self._cpu_moe_patterns):
+                self._cpu_moe_tensor_buft_overrides[i].pattern = pattern
+                self._cpu_moe_tensor_buft_overrides[i].buft = cpu_buft
+
+            self._cpu_moe_tensor_buft_overrides[len(patterns)].pattern = None
+            self._cpu_moe_tensor_buft_overrides[len(patterns)].buft = None
+
+            self.model_params.tensor_buft_overrides = (
+                self._cpu_moe_tensor_buft_overrides
+            )
 
         # kv_overrides is the original python dict
         self.kv_overrides = kv_overrides
@@ -275,7 +352,7 @@ class Llama:
             # _kv_overrides_array is a ctypes.Array of llama_model_kv_override Structs
             kvo_array_len = len(kv_overrides) + 1  # for sentinel element
             self._kv_overrides_array = (
-                llama_cpp.llama_model_kv_override * kvo_array_len
+                llama_cpp_lib.llama_model_kv_override * kvo_array_len
             )()
 
             for i, (k, v) in enumerate(kv_overrides.items()):
@@ -283,17 +360,17 @@ class Llama:
                 if isinstance(v, bool):
                     self._kv_overrides_array[
                         i
-                    ].tag = llama_cpp.LlamaModelKVOverrideType.LLAMA_KV_OVERRIDE_TYPE_BOOL.value
+                    ].tag = llama_cpp_lib.LlamaModelKVOverrideType.LLAMA_KV_OVERRIDE_TYPE_BOOL.value
                     self._kv_overrides_array[i].value.val_bool = v
                 elif isinstance(v, int):
                     self._kv_overrides_array[
                         i
-                    ].tag = llama_cpp.LlamaModelKVOverrideType.LLAMA_KV_OVERRIDE_TYPE_INT.value
+                    ].tag = llama_cpp_lib.LlamaModelKVOverrideType.LLAMA_KV_OVERRIDE_TYPE_INT.value
                     self._kv_overrides_array[i].value.val_i64 = v
                 elif isinstance(v, float):
                     self._kv_overrides_array[
                         i
-                    ].tag = llama_cpp.LlamaModelKVOverrideType.LLAMA_KV_OVERRIDE_TYPE_FLOAT.value
+                    ].tag = llama_cpp_lib.LlamaModelKVOverrideType.LLAMA_KV_OVERRIDE_TYPE_FLOAT.value
                     self._kv_overrides_array[i].value.val_f64 = v
                 elif isinstance(v, str):  # type: ignore
                     v_bytes = v.encode("utf-8")
@@ -302,12 +379,12 @@ class Llama:
                     v_bytes = v_bytes.ljust(128, b"\0")
                     self._kv_overrides_array[
                         i
-                    ].tag = llama_cpp.LlamaModelKVOverrideType.LLAMA_KV_OVERRIDE_TYPE_STR.value
+                    ].tag = llama_cpp_lib.LlamaModelKVOverrideType.LLAMA_KV_OVERRIDE_TYPE_STR.value
                     # copy min(v_bytes, 128) to str_value
                     address = typing.cast(
                         int,
                         ctypes.addressof(self._kv_overrides_array[i].value)
-                        + llama_cpp.llama_model_kv_override_value.val_str.offset,
+                        + llama_cpp_lib.llama_model_kv_override_value.val_str.offset,
                     )
                     buffer_start = ctypes.cast(address, ctypes.POINTER(ctypes.c_char))
                     ctypes.memmove(
@@ -324,15 +401,16 @@ class Llama:
             self.model_params.kv_overrides = self._kv_overrides_array
 
         self.n_batch = min(n_ctx, n_batch)  # ???
+        self.n_keep = n_keep if n_keep > 0 else 256
         self.n_seq_max = n_seq_max
         self.n_threads = n_threads or max(multiprocessing.cpu_count() // 2, 1)
         self.n_threads_batch = n_threads_batch or multiprocessing.cpu_count()
 
         # Used by the sampler
-        self._seed = seed or llama_cpp.LLAMA_DEFAULT_SEED
+        self._seed = seed or llama_cpp_lib.LLAMA_DEFAULT_SEED
 
         # Context Params
-        self.context_params = llama_cpp.llama_context_default_params()
+        self.context_params = llama_cpp_lib.llama_context_default_params()
         self.context_params.n_ctx = n_ctx
         self.context_params.n_batch = self.n_batch
         self.context_params.n_ubatch = min(self.n_batch, n_ubatch)
@@ -342,22 +420,22 @@ class Llama:
         self.context_params.rope_scaling_type = (
             rope_scaling_type
             if rope_scaling_type is not None
-            else llama_cpp.llama_rope_scaling_type.LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED
+            else llama_cpp_lib.llama_rope_scaling_type.LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED
         )
         self.context_params.pooling_type = (
             pooling_type
             if pooling_type is not None
-            else llama_cpp.LLAMA_POOLING_TYPE_UNSPECIFIED
+            else llama_cpp_lib.LLAMA_POOLING_TYPE_UNSPECIFIED
         )
         self.context_params.attention_type = (
             attention_type
             if attention_type is not None
-            else llama_cpp.llama_attention_type.LLAMA_ATTENTION_TYPE_UNSPECIFIED
+            else llama_cpp_lib.llama_attention_type.LLAMA_ATTENTION_TYPE_UNSPECIFIED
         )
         self.context_params.flash_attn_type = (
             flash_attn_type
             if flash_attn_type is not None
-            else llama_cpp.llama_flash_attn_type.LLAMA_FLASH_ATTN_TYPE_AUTO
+            else llama_cpp_lib.llama_flash_attn_type.LLAMA_FLASH_ATTN_TYPE_AUTO
         )
         self.context_params.rope_freq_base = (
             rope_freq_base if rope_freq_base != 0.0 else 0
@@ -406,10 +484,6 @@ class Llama:
         self.last_n_tokens_size = last_n_tokens_size
 
         self.cache: Optional[BaseLlamaCache] = None
-
-        self.lora_base = lora_base
-        self.lora_scale = lora_scale
-        self.lora_path = lora_path
 
         self.spm_infill = spm_infill
 
@@ -466,6 +540,34 @@ class Llama:
             )
         )
 
+        # Hybrid architecture detection
+        _is_recurrent = self._model.is_recurrent()
+        _is_hybrid = self._model.is_hybrid()
+        _n_swa = self._model.n_swa()
+        # Sync llama.cpp upstream (#20291): warn swa-full is not supported for non-SWA models.
+        if _n_swa == 0:
+            if (self.context_params.swa_full):
+                self.context_params.swa_full = False
+                if self.verbose:
+                    print("Llama.__init__: swa_full is not supported by this model, it will be disabled", file=sys.stderr)
+
+        # checkpoints are created only if:
+        # - the model uses SWA and we are not using `swa_full`
+        # - the model architecture is marked as recurrent or hybrid
+        self.is_hybrid = _is_recurrent or _is_hybrid or (_n_swa > 0 and not self.context_params.swa_full)
+
+        if self.is_hybrid:
+            if self.verbose:
+                print(f"Llama.__init__: Hybrid/Recurrent model detected."
+                      f"(is_recurrent: {_is_recurrent}, is_hybrid: {_is_hybrid}, n_swa: {_n_swa}, swa_full: {self.context_params.swa_full}). "
+                      f" Enabling HybridCheckpointCache(ctx_checkpoints={ctx_checkpoints}, checkpoint_interval={checkpoint_interval}).",
+                      file=sys.stderr)
+            self.ctx_checkpoints = ctx_checkpoints
+            self.checkpoint_interval = checkpoint_interval
+            self._hybrid_cache_mgr = HybridCheckpointCache(self._ctx.ctx, max_checkpoints=self.ctx_checkpoints, verbose=self.verbose)
+        else:
+            self._hybrid_cache_mgr = None
+
         self._batch = self._stack.enter_context(
             contextlib.closing(
                 internals.LlamaBatch(
@@ -477,36 +579,8 @@ class Llama:
             )
         )
 
-        self._lora_adapter: Optional[llama_cpp.llama_adapter_lora_p] = None
-
-        if self.lora_path:
-            self._lora_adapter = llama_cpp.llama_adapter_lora_init(
-                self._model.model,
-                self.lora_path.encode("utf-8"),
-            )
-            if self._lora_adapter is None:
-                raise RuntimeError(
-                    f"Failed to initialize LoRA adapter from lora path: {self.lora_path}"
-                )
-
-            def free_lora_adapter():
-                if self._lora_adapter is None:
-                    return
-                llama_cpp.llama_adapter_lora_free(self._lora_adapter)
-                self._lora_adapter = None
-
-            self._stack.callback(free_lora_adapter)
-
-            # Todo(JamePeng): The current LoRa loading logic is outdated and needs to be refactored.
-            if llama_cpp.llama_set_adapters_lora(
-                self._ctx.ctx, self._lora_adapter, self.lora_scale
-            ):
-                raise RuntimeError(
-                    f"Failed to set LoRA adapter from lora path: {self.lora_path}"
-                )
-
         if self.verbose:
-            print(llama_cpp.llama_print_system_info().decode("utf-8"), file=sys.stderr)
+            print(llama_cpp_lib.llama_print_system_info().decode("utf-8"), file=sys.stderr)
 
         self.chat_format = chat_format
         self.chat_handler = chat_handler
@@ -527,11 +601,6 @@ class Llama:
         self.n_tokens = 0
         self.input_ids: npt.NDArray[np.intc] = np.ndarray((n_ctx,), dtype=np.intc)
         self.scores: npt.NDArray[np.single] = np.ndarray((n_ctx if self._logits_all else 1, self._n_vocab), dtype=np.single)
-
-
-        self._mirostat_mu = ctypes.c_float(
-            2.0 * 5.0
-        )  # TODO: Move this to sampling context
 
         try:
             self.metadata = self._model.metadata()
@@ -624,6 +693,9 @@ class Llama:
 
         self._sampling_ctx: Optional[LlamaSamplingContext] = None
 
+        # Create a thread-safe interrupt event
+        self._abort_event = threading.Event()
+
     def close(self) -> None:
         """Explicitly free the model from memory."""
         if getattr(self, "_sampling_ctx", None) is not None:
@@ -634,6 +706,10 @@ class Llama:
             self._candidates.close()
             self._candidates = None
 
+        if getattr(self, "_hybrid_cache_mgr", None) is not None and hasattr(self._hybrid_cache_mgr, "close"):
+            self._hybrid_cache_mgr.close()
+            self._hybrid_cache_mgr = None
+
         if hasattr(self, "chat_handler") and hasattr(self.chat_handler, "close"):
             self.chat_handler.close()
 
@@ -641,23 +717,48 @@ class Llama:
         self.context_params = None
         self.chat_handler = None
         self.input_ids = None
+        self.metadata = None
         self.scores = None
         self.tokenizer_ = None
 
         self._c_tensor_split = None
         self._kv_overrides_array = None
 
-        self._stack.close()
+        if getattr(self, "_stack", None) is not None and hasattr(self._stack, "close"):
+            self._stack.close()
+            self._stack = None
 
     def __del__(self) -> None:
         self.close()
 
+    @staticmethod
+    def _parse_n_gpu_layers(n_gpu_layers: Union[int, str]) -> int:
+        if isinstance(n_gpu_layers, str):
+            value = n_gpu_layers.strip().lower()
+            if value == "auto":
+                return -1
+            if value == "all":
+                return -2
+            try:
+                return int(value)
+            except ValueError as exc:
+                raise ValueError("n_gpu_layers must be an int, 'auto', or 'all'") from exc
+
+        if isinstance(n_gpu_layers, int):
+            return n_gpu_layers
+
+        raise TypeError("n_gpu_layers must be an int, 'auto', or 'all'")
+
+    @staticmethod
+    def _make_cpu_moe_pattern(i: int) -> bytes:
+        return f"blk\\.{i}".encode("utf-8") + Llama.LLM_FFN_EXPS_REGEX
+
     @property
-    def ctx(self) -> llama_cpp.llama_context_p:
+    def ctx(self) -> llama_cpp_lib.llama_context_p:
         return self._ctx.ctx
 
     @property
-    def model(self) -> llama_cpp.llama_model_p:
+    def model(self) -> llama_cpp_lib.llama_model_p:
         return self._model.model
 
     @property
@@ -681,6 +782,29 @@ class Llama:
             self.scores[: self.n_tokens, :].tolist(),
             maxlen=self._n_ctx if self._logits_all else 1,
         )
+
+    # LoRA / Adapter Management API
+
+    def load_lora(self, name: str, path: str):
+        """Loads a LoRA adapter into VRAM without applying it yet."""
+        self._model.load_lora(name, path)
+
+    def unload_lora(self, name: str):
+        """Actively unloads a specific LoRA to free up VRAM."""
+        self._model.unload_lora(name)
+
+    @property
+    def loaded_lora_count(self) -> int:
+        """Returns the total number of LoRA adapters currently loaded in VRAM."""
+        return self._model.loaded_lora_count
+
+    def list_loras(self) -> List[str]:
+        """Returns a list of all registered LoRA names."""
+        return self._model.list_loras()
+
+    def unload_all_loras(self):
+        """Iterates through the registry and forces VRAM release for all loaded LoRAs."""
+        self._model.unload_all_loras()
 
     def tokenize(
         self, text: bytes, add_bos: bool = True, special: bool = False
@@ -740,67 +864,244 @@ class Llama:
         """Reset the model state."""
         self.n_tokens = 0
 
-    def eval(self, tokens: Sequence[int]):
+    def abort(self) -> None:
+        """
+        Safely aborts any ongoing text generation.
+        Useful for async API environments or UI interruption buttons.
+        """
+        if self.verbose:
+            print(f"Llama.abort: Abort signal received. Terminating generation...", file=sys.stderr)
+        self._abort_event.set()
+
+    def eval(
+            self,
+            tokens: Sequence[int],
+            active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
+            control_vector: Optional[Dict[str, Any]] = None,
+    ):
         """Evaluate a list of tokens.
 
         Args:
             tokens: The list of tokens to evaluate.
         """
-        if len(tokens) == 0:
-            return
         n_eval = len(tokens)
-        current_pos = self.n_tokens
+        if n_eval == 0:
+            return
 
-        if self._ctx:
-            # Standard cleanup by current_pos
-            is_success = self._ctx.memory_seq_rm(0, current_pos, -1)
-            # Fallback: Broad cleanup
-            if not is_success:
-                if self.verbose:
-                    print(f"WARN: memory_seq_rm(0, {current_pos}, -1) failed. Executing fallback: memory_seq_rm(0, 0, -1)")
-                is_success = self._ctx.memory_seq_rm(0, 0, -1)
-
-        for i in range(0, n_eval, self.n_batch):
-            batch = tokens[i : min(n_eval, i + self.n_batch)]
-            n_past = self.n_tokens
-            n_batch_tokens = len(batch)
-            self._batch.set_batch(
-                batch=batch, n_past=n_past, logits_all=self._logits_all
-            )
-            try:
-                self._ctx.decode(self._batch)
-            except Exception as e:
+        # Context Shift: Prevent OOM by discarding older tokens when context limit is reached.
+        if self.n_tokens + n_eval > self._n_ctx:
+            # 0. Check if the memory supports shifting
+            if not self._ctx.memory_can_shift():
                 raise RuntimeError(
-                    f"Decode Failed at Pos {current_pos}. "
-                    f"Batch size: {n_batch_tokens}. "
-                    f"Result of memory_seq_rm: {is_success}. "
-                    f"Error: {str(e)}."
-                ) from e
-            # Save tokens
-            self.input_ids[n_past : n_past + n_batch_tokens] = batch
+                    f"Llama.eval: Context Shift is explicitly disabled by the C++ backend "
+                    f"(n_pos_per_embd > 1 or incompatible M-RoPE). "
+                    f"You MUST increase n_ctx (currently {self._n_ctx}) to fit the dialogue."
+                )
+            # 1. Calculate the absolute minimum number of tokens we must discard to fit the new chunk.
+            required_discard = (self.n_tokens + n_eval) - self._n_ctx
 
-            # Save logits
-            logits_ptr = self._ctx.get_logits()
+            # 2. Sanity check: If the incoming chunk itself is larger than the entire context window,
+            # shifting is physically impossible.
+            if required_discard > self.n_tokens:
+                raise RuntimeError(f"Llama.eval: Context shift failed. The incoming chunk ({n_eval} tokens) "
+                                   f"is larger than the entire context window ({self._n_ctx}).")
+
+            # 3. Determine how many tokens to keep at the beginning (usually the System Prompt).
+            _n_keep_desired = min(self.n_keep, self.n_tokens)
+
+            # Ensure that keeping these tokens doesn't prevent us from discarding the required amount.
+            max_keep_allowed = max(0, self.n_tokens - required_discard)
+            _n_keep = min(_n_keep_desired, max_keep_allowed)
+
+            # 4. Calculate the final discard count. Default strategy is to discard half of the available
+            # past tokens to minimize frequent shifting, but it must be at least `required_discard`.
+            _n_discard = max(required_discard, (self.n_tokens - _n_keep) // 2)
+
+            # 5. Execute the shift only if there are tokens to discard.
+            if _n_discard > 0:
+                if self.verbose:
+                    model_type = "Hybrid/Recurrent/SWA" if getattr(self, 'is_hybrid', False) else "Transformer"
+                    print(f"Llama.eval: {model_type} context limit reached. Shifting context: "
+                          f"keeping {_n_keep}, discarding {_n_discard} tokens...", file=sys.stderr)
+
+                try:
+                    # Remove the specified block of tokens from the physical KV cache
+                    self._ctx.memory_seq_rm(0, _n_keep, _n_keep + _n_discard)
+
+                    # Shift the positional IDs of all subsequent tokens to the left to close the gap
+                    self._ctx.memory_seq_add(0, _n_keep + _n_discard, self.n_tokens, -_n_discard)
+                except Exception as e:
+                    # Defense-in-depth: Catch any other recoverable backend errors
+                    raise RuntimeError(f"Llama.eval: Context Shift failed at the C++ level. Error: {str(e)}") from e
+
+                # 6. Synchronize the Python-side token tracking array (ledger)
+                remaining_len = self.n_tokens - (_n_keep + _n_discard)
+                if remaining_len > 0:
+                    self.input_ids[_n_keep : _n_keep + remaining_len] = self.input_ids[_n_keep + _n_discard : self.n_tokens]
+
+                # 7. Update the global token counter
+                self.n_tokens -= _n_discard
+
+        # Adaptive batch downgrade limit initialization
+        current_max_batch = self.n_batch
+        last_ckpt_pos = self.n_tokens
+
+        # Adaptive Periodic Checkpointing for Hybrid Models
+        # Following the "no more than three times" principle :)
+        # when pre-filling very large blocks, dilute the save frequency to minimize I/O blocking.
+        if self.is_hybrid and self._hybrid_cache_mgr is not None:
+            dynamic_interval = max(self.checkpoint_interval, n_eval // 3)  # Maximum of 3 triggers
+
+        # If KV slots are full, `current_batch_size` will be halved.
+        # A `while` loop allows us to correctly resume from the exact cut-off point.
+        i = 0
+        while i < n_eval:
+            # Chunk the tokens using the adaptive current_max_batch
+            n_chunk = min(n_eval - i, current_max_batch)
+            chunk = tokens[i : i + n_chunk]
+            n_past = self.n_tokens
+
+            self._batch.reset()
+
+            pos_array = [self.n_tokens + j for j in range(n_chunk)]
+
+            # Configure logits extraction:
+            # If _logits_all is True, calculate for every token.
+            # Otherwise, only calculate for the very last token in the entire evaluation sequence.
             if self._logits_all:
-                rows = n_batch_tokens
+                logits_array = [True] * n_chunk
+            else:
+                logits_array = [False] * n_chunk
+                if i + n_chunk == n_eval:
+                    logits_array[-1] = True
+
+            self._batch.add_sequence(
+                token_array=chunk,
+                pos_array=pos_array,
+                seq_ids=[0],
+                logits_array=logits_array
+            )
+
+            # JIT Dynamic LoRAs Weights Mounting
+
+            # Dynamic LoRA Routing
+            if active_loras is not None:
+                adapters_to_apply = []
+                for lora in active_loras:
+                    name = lora.get("name")
+                    scale = float(lora.get("scale", 1.0))
+                    adapter_obj = getattr(self._model, "_lora_registry", {}).get(name)
+                    if adapter_obj:
+                        adapters_to_apply.append((adapter_obj, scale))
+                    elif self.verbose:
+                        print(f"Llama.eval: Warning! LoRA '{name}' not found in registry. Skipping.", file=sys.stderr)
+
+                self._ctx.apply_loras(adapters_to_apply)
+            else:
+                # Crucial Fallback: Wipe the graph clean if no LoRAs are requested.
+                # This guarantees zero weight contamination between different users/slots in a multiplexed environment.
+                self._ctx.clear_loras()
+
+            # Dynamic Control Vector (CVec) Injection
+            if control_vector is not None:
+                data = control_vector.get("data", [])
+                il_start = control_vector.get("layer_start", 1)
+                il_end = control_vector.get("layer_end", self.n_layer())
+                n_embd = self.n_embd()
+
+                self._ctx.apply_cvec(data, n_embd, il_start, il_end)
+            else:
+                # Ensure the control vector is cleared for a clean state
+                self._ctx.clear_cvec()
+
+            # Dynamic Batch Downgrade: Attempt to decode, reduce batch size if KV cache is fragmented
+            current_batch_size = n_chunk
+            success = False
+
+            while current_batch_size > 0:
+                # Tell the C++ backend to only process up to `current_batch_size` tokens
+                self._batch.batch.n_tokens = current_batch_size
+
+                try:
+                    status = self._ctx.decode(self._batch)
+
+                    # 0: Success
+                    if status == 0:
+                        success = True
+                        # If we successfully decoded after a downgrade,
+                        # update current_max_batch to prevent repeated failures in next iterations.
+                        if current_batch_size < current_max_batch:
+                            current_max_batch = current_batch_size
+                        break
+
+                    # 1: No KV slot available (Recoverable)
+                    elif status == 1:
+                        if current_batch_size == 1:
+                            if self.verbose:
+                                print("Llama.eval: KV slots completely full. "
+                                      "Cannot reduce batch size below 1. Aborting...", file=sys.stderr)
+                            break
+                        if self.verbose:
+                            print(f"Llama.eval: KV slots full (Code 1). Halving batch size "
+                                  f"from {current_batch_size} to {current_batch_size // 2}...", file=sys.stderr)
+                        current_batch_size //= 2
+
+                except Exception as e:
+                    # Catch fatal backend failures (e.g., Code -2, -3)
+                    raise RuntimeError(f"Llama.eval(decode): Fatal Decode Error at Pos {self.n_tokens}, "
+                                       f"Batch size {current_batch_size}: {str(e)}") from e
+
+            if not success:
+                raise RuntimeError("Llama.eval(decode): Failed completely even with batch size 1.")
+
+            # Save successfully processed tokens into the Python-side ledger
+            self.input_ids[n_past : n_past + current_batch_size] = chunk[:current_batch_size]
+
+            # Extract and save all logits if requested, ensuring we only copy the successfully processed rows
+            if self._logits_all:
+                logits_ptr = self._ctx.get_logits()
+                rows = current_batch_size
                 cols = self._n_vocab
                 logits_view = np.ctypeslib.as_array(logits_ptr, shape=(rows * cols,))
-                self.scores[n_past : n_past + n_batch_tokens, :].reshape(-1)[:] = logits_view
-            else:
-                logits_view = np.ctypeslib.as_array(logits_ptr, shape=(self._n_vocab,))
-                self.scores[0, :] = logits_view
+                self.scores[n_past : n_past + current_batch_size, :].reshape(-1)[:] = logits_view
 
-            # Update n_tokens
-            current_pos += n_batch_tokens
-            self.n_tokens = current_pos
+            # Update indices based on actual processed batch size
+            self.n_tokens += current_batch_size
+            i += current_batch_size
+
+            # Periodic Checkpoint: Save states for hybrid models to avoid massive rollbacks
+            if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                current_pos = self.n_tokens
+                if (current_pos - last_ckpt_pos >= dynamic_interval) and (i < n_eval):
+
+                    if self.verbose:
+                        print(f"Llama.eval: [Periodic Checkpoint] Saving hybrid state at pos {current_pos} "
+                              f"(checkpoint_interval({dynamic_interval}) reached, last={last_ckpt_pos}).", file=sys.stderr)
+
+                    success = self._hybrid_cache_mgr.save_checkpoint(
+                        current_pos=current_pos,
+                        tokens=self.input_ids[:current_pos].tolist(),
+                        seq_id=0
+                    )
+                    if success:
+                        last_ckpt_pos = current_pos
+                    else:
+                        if self.verbose:
+                            print(f"Llama.eval: [Periodic Checkpoint] HybridCheckpoint save failed at pos {current_pos}, skipping update", file=sys.stderr)
+
+        # Save the final logit if not in _logits_all mode
+        if not self._logits_all:
+            logits_ptr = self._ctx.get_logits()
+            logits_view = np.ctypeslib.as_array(logits_ptr, shape=(self._n_vocab,))
+            self.scores[0, :] = logits_view
 
     # Helper method: Convert dict logit_bias to List[llama_logit_bias]
-    def _convert_logit_bias(self, logit_bias: Optional[Dict[int, float]]) -> List[llama_cpp.llama_logit_bias]:
+    def _convert_logit_bias(self, logit_bias: Optional[Dict[int, float]]) -> List[llama_cpp_lib.llama_logit_bias]:
         if not logit_bias:
             return []
         bias_list = []
         for token, bias in logit_bias.items():
-            lb = llama_cpp.llama_logit_bias()
+            lb = llama_cpp_lib.llama_logit_bias()
             lb.token = token
             lb.bias = bias
             bias_list.append(lb)
@@ -849,6 +1150,7 @@ class Llama:
         grammar: Optional[LlamaGrammar] = None, # optional BNF-like grammar to constrain sampling
         grammar_lazy: bool = False,
         idx: Optional[int] = None,
+        seed: Optional[int] = None,
     ):
         """Sample a token from the model.
         Returns:
@@ -870,6 +1172,7 @@ class Llama:
                 temp=temp,
                 top_n_sigma=top_n_sigma,
                 min_keep=min_keep,
+                seed=seed if seed is not None else self._seed,
 
                 # Dynamic Temp
                 dynatemp_range=dynatemp_range,
@@ -910,7 +1213,7 @@ class Llama:
 
             # LogitsProcessor Adapter
             if logits_processor:
-                def adapter(token_data_array: llama_cpp.llama_token_data_array):
+                def adapter(token_data_array: llama_cpp_lib.llama_token_data_array):
                     if self._logits_all:
                         current_scores = self._scores[self.n_tokens - 1, :]
                     else:
@@ -976,7 +1279,10 @@ class Llama:
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         grammar: Optional[LlamaGrammar] = None,
-        grammar_lazy :bool = False,
+        grammar_lazy: bool = False,
+        seed: Optional[int] = None,
+        active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
+        control_vector: Optional[Dict[str, Any]] = None,
     ) -> Generator[int, Optional[Sequence[int]], None]:
         """Create a generator of tokens from a prompt.
 
@@ -987,16 +1293,144 @@ class Llama:
             ...     print(llama.detokenize([token]))
 
         Args:
-            tokens: The prompt tokens.
-            top_k: The top-k sampling parameter.
-            top_p: The top-p sampling parameter.
-            temp: The temperature parameter.
-            repeat_penalty: The repeat penalty parameter.
-            reset: Whether to reset the model state.
+            tokens: The prompt tokens to evaluate.
+            top_k: Limit the next token selection to the K most probable tokens. (<=0 to use vocab size)
+            top_p: Nucleus sampling. Limits selection to a cumulative probability of P.
+            min_p: Minimum P sampling. Drops tokens with a probability less than min_p relative to the most likely token.
+            typical_p: Locally typical sampling. (1.0 = disabled)
+            temp: Temperature. Controls randomness. (<=0.0 greedy, 0.0 no probabilities)
+            dynatemp_range: Range of dynamic temperature.
+            dynatemp_exponent: Exponent of dynamic temperature.
+            top_n_sigma: Limit selection to tokens within n * sigma of the max logit. (-1.0 = disabled)
+            min_keep: Minimum tokens to keep for sampling.
+            penalty_last_n: Last n tokens to penalize (0 = disable penalty, -1 = context size).
+            repeat_penalty: General penalty for repeated tokens. (1.0 = disabled)
+            frequency_penalty: Penalty based on the absolute frequency of a token in the prompt.
+            present_penalty: Flat penalty applied if a token is present anywhere in the context.
+            reset: If True, attempts to automatically match the KV cache prefix to avoid re-evaluation. If False, blindly appends tokens to existing context.
+            mirostat_mode: Mirostat sampling mode (0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0).
+            mirostat_tau: Target cross-entropy (surprisal) for Mirostat.
+            mirostat_eta: Learning rate for Mirostat.
+            xtc_threshold: Minimum probability threshold for XTC token removal.
+            xtc_probability: Chance for token removal in XTC sampling.
+            dry_multiplier: DRY (Don't Repeat Yourself) repetition penalty multiplier (0.0 = disabled).
+            dry_base: DRY repetition penalty base value.
+            dry_allowed_length: DRY maximum allowed sequence length without penalty.
+            dry_penalty_last_n: DRY tokens to scan for repetitions (0 = disabled, -1 = context size).
+            dry_seq_breakers: Array of sequence breakers for DRY sampling.
+            adaptive_target: Adaptive-p target probability (0.0 to 1.0, negative = disabled).
+            adaptive_decay: Adaptive-p decay rate (0.0 to 0.99).
+            use_infill: Activate specialized fill-in-the-middle sampler.
+            ignore_eos: If True, ignore the End-of-Sequence token.
+            logit_bias: Dictionary mapping token IDs to their bias values.
+            logits_processor: List of custom Python callbacks to modify logits in-place.
+            stopping_criteria: List of custom callbacks to halt generation dynamically.
+            grammar: Optional BNF-like grammar (GBNF) to constrain sampling syntax.
+            grammar_lazy: If True, activates grammar constraints only on specific trigger tokens.
+            seed: RNG seed for sampling. Overrides the instance seed.
+            active_loras: A list of dictionaries specifying the LoRA adapters to dynamically apply during generation.
+                Each dictionary must contain a "name" key (matching a LoRA previously loaded into VRAM via `load_lora()`)
+                and an optional "scale" key (float, defaults to 1.0).
+                Example: `[{"name": "role_A", "scale": 0.85}, {"name": "role_B", "scale": 0.5}]`.
+            control_vector: A dictionary containing Control Vector (CVec) data for representation engineering.
+                Must contain a "data" key with a flattened 1D list of floats.
+                Optionally accepts "layer_start" (int, defaults to 1) and "layer_end" (int, defaults to the model's total layer count).
+                Note: The length of the "data" list MUST be at least `n_embd * layer_end`, with zero-padding for any skipped early layers.
 
         Yields:
             The generated tokens.
         """
+        original_tokens = list(tokens)
+        # Check for kv cache prefix match
+        if reset and self.n_tokens > 0:
+            # 1. First, check for a 100% exact match of the entire sequence
+            full_match_prefix = self.longest_token_prefix(self._input_ids, tokens, self.verbose)
+
+            # --- FAST PATH: Zero-latency bypass for Hybrid Single-Turn & Multimodal ---
+            # If the cache is disabled (max_checkpoints <= 0) and we have a 100% match,
+            # we completely skip the N-1 truncation. This ensures that multimodal handlers
+            # (which just finished evaluating and already hold fresh logits) don't trigger
+            # unnecessary N-1 rollbacks or catastrophic KV cache clears.
+            if (
+                full_match_prefix == len(tokens)
+                and full_match_prefix == self.n_tokens
+                and self.is_hybrid
+                and (self._hybrid_cache_mgr is None or self._hybrid_cache_mgr.max_checkpoints <= 0)
+            ):
+                reset = False
+                longest_prefix = len(tokens)
+                tokens = tokens[longest_prefix:] # Empties the tokens array to bypass evaluation
+                if self.verbose:
+                    print(f"Llama.generate: Hybrid single-turn full match ({longest_prefix} tokens). Bypassing rollback/truncation.", file=sys.stderr)
+
+            # --- STANDARD PATH: Force N-1 re-evaluation ---
+            else:
+                # By matching against `tokens[:-1]`, we intentionally drop the last token.
+                # This forces the engine to re-evaluate the final token to refresh sampling logits.
+                longest_prefix = self.longest_token_prefix(self._input_ids, tokens[:-1], self.verbose)
+
+                if longest_prefix > 0:
+                    reset = False
+
+                    # Note: Kept for legacy compatibility. Triggers if the prefix matching
+                    # somehow equals the full token length (e.g., edge cases in tokenization).
+                    if longest_prefix == len(tokens):
+                        if self.is_hybrid and (self._hybrid_cache_mgr is None or self._hybrid_cache_mgr.max_checkpoints <= 0):
+                            if self.verbose:
+                                print(f"Llama.generate: Full match on disabled hybrid cache. Skipping prefix-- to use existing fresh logits.", file=sys.stderr)
+                        else:
+                            if self.verbose:
+                                print(f"Llama.generate: Full match. Forcing prefix-- to evaluate 1 token.", file=sys.stderr)
+                            longest_prefix -= 1
+
+                    # Physically erase trailing "ghost" tokens from the C++ KV cache
+                    # to prevent attention misalignment in multi-round chats.
+                    if longest_prefix < self.n_tokens:
+                        if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                            if self.verbose:
+                                print(f"Llama.generate: Hybrid model rollback triggered.", file=sys.stderr)
+
+                            best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(original_tokens, 0)
+                            if best_ckpt is not None and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
+                                actual_prefix = best_ckpt.pos
+                            else:
+                                # Fallback: No checkpoint found, must fully clear the context to prevent poisoning
+                                actual_prefix = 0
+                                self._hybrid_cache_mgr.clear()
+                                self._ctx.memory_clear(True)
+
+                            self.n_tokens = actual_prefix
+                            tokens = original_tokens[actual_prefix:]
+                            if self.verbose:
+                                print(
+                                    f"Llama.generate: {actual_prefix} prefix-match hit, "
+                                    f"remaining {len(tokens)} prompt tokens to eval",
+                                    file=sys.stderr,
+                                )
+                        else:
+                            if self.verbose:
+                                print(f"Llama.generate: Truncating KV cache size from {self.n_tokens} to {longest_prefix}", file=sys.stderr)
+                            self._ctx.memory_seq_rm(0, longest_prefix, -1)
+
+                            # Adjust the tokens array and cursor to reuse the matched cache
+                            self.n_tokens = longest_prefix
+                            tokens = tokens[longest_prefix:]
+
+                            if self.verbose:
+                                print(
+                                    f"Llama.generate: {longest_prefix} prefix-match hit, "
+                                    f"remaining {len(tokens)} prompt tokens to eval",
+                                    file=sys.stderr,
+                                )
+        if reset:
+            # No prefix matched at all. Completely clear the KV cache to prevent context poisoning.
+            self.n_tokens = 0
+            self._ctx.memory_clear(True)
+            if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                self._hybrid_cache_mgr.clear()
+            if self.verbose:
+                print("Llama.generate: Context reset requested or no prefix match. Cleared KV cache.", file=sys.stderr)
+
         # Reset mirostat sampling
         params = LlamaSamplingParams(
             # Core Sampling
@@ -1043,10 +1477,12 @@ class Llama:
             logit_bias=self._convert_logit_bias(logit_bias),
             grammar=grammar._grammar if grammar else "",
             grammar_lazy=grammar_lazy,
+            seed=seed if seed is not None else self._seed,
         )
 
+        # Register custom python-level logits processors if provided
         if logits_processor:
-            def adapter(token_data_array: llama_cpp.llama_token_data_array):
+            def adapter(token_data_array: llama_cpp_lib.llama_token_data_array):
                 if self._logits_all:
                     current_scores = self._scores[self.n_tokens - 1, :]
                 else:
@@ -1066,92 +1502,124 @@ class Llama:
             if CommonSamplerType.CUSTOM not in params.samplers:
                 params.samplers.insert(3, CommonSamplerType.CUSTOM)
 
+        # Free previous sampling context to prevent memory leaks
         if getattr(self, "_sampling_ctx", None) is not None:
             self._sampling_ctx.close()
             self._sampling_ctx = None
 
         self._sampling_ctx = LlamaSamplingContext(params, self._model)
 
-        # Check for kv cache prefix match
-        if reset and self.n_tokens > 0:
-            longest_prefix = self.longest_token_prefix(self._input_ids, tokens[:-1])
-            if longest_prefix > 0:
-                reset = False
-
-                # Physically erase trailing "ghost" tokens from the C++ KV cache
-                # to prevent attention misalignment in multi-round chats.
-                if longest_prefix < self.n_tokens:
-                    if self.verbose:
-                        print(f"Llama.generate: Truncating KV cache size from {self.n_tokens} to {longest_prefix}", file=sys.stderr)
-                    self._ctx.memory_seq_rm(0, longest_prefix, -1)
-
-                # Adjust the tokens array and cursor to reuse the matched cache
-                tokens = tokens[longest_prefix:]
-                self.n_tokens = longest_prefix
-
-                if self.verbose:
-                    print(
-                        f"Llama.generate: {longest_prefix} prefix-match hit, "
-                        f"remaining {len(tokens)} prompt tokens to eval",
-                        file=sys.stderr,
-                    )
-            else:
-                # No prefix matched. Completely clear the KV cache to prevent context poisoning.
-                self.n_tokens = 0
-                self._ctx.memory_clear(True)
-
-        # Reset the model state
-        if reset:
-            self.reset()
-
         sample_idx = self.n_tokens + len(tokens) - 1
         tokens = list(tokens)
 
-        # Eval and sample
-        while True:
-            self.eval(tokens)
-            while sample_idx < self.n_tokens:
-                token = self._sampling_ctx.sample(self._ctx, idx=-1)
-                self._sampling_ctx.accept(token, False if grammar is None else True)
-
-                sample_idx += 1
-                if stopping_criteria is not None:
-                    if self._logits_all:
-                        logits_idx = sample_idx - self.n_tokens
-                        check_stopping = True
-                    else:
-                        if sample_idx == self.n_tokens:
-                            logits_idx = 0
-                            check_stopping = True
-                        else:
-                            check_stopping = False
-
-                    if check_stopping and stopping_criteria(
-                        self._input_ids[: sample_idx],
-                        self._scores[logits_idx, :]
+        # Main evaluation and generation loop
+        try:
+            while True:
+                if len(tokens) > 0:
+                    # For hybrid models processing a prompt (len > 1), force an N-1 checkpoint
+                    # to safely allow 1-token rollbacks (e.g., for seed changes on 100% prompt matches).
+                    # ONLY apply this if rollback capabilities are enabled (max_checkpoints > 0).
+                    if (
+                        self.is_hybrid
+                        and self._hybrid_cache_mgr is not None
+                        and self._hybrid_cache_mgr.max_checkpoints > 0
+                        and len(tokens) > 1
                     ):
+                        body_tokens = tokens[:-1]
+                        last_token = [tokens[-1]]
+
+                        # 1. Evaluate up to N-1
+                        self.eval(body_tokens, active_loras=active_loras, control_vector=control_vector)
+
+                        # 2. Save the N-1 state snapshot
+                        current_history = self._input_ids[:self.n_tokens].tolist()
+                        self._hybrid_cache_mgr.save_checkpoint(
+                            current_pos=self.n_tokens,
+                            tokens=current_history,
+                            seq_id=0
+                        )
+                        # 3. Evaluate the final token to refresh logits
+                        self.eval(last_token, active_loras=active_loras, control_vector=control_vector)
+                    else:
+                        # Standard evaluation or single-token generation step
+                        self.eval(tokens, active_loras=active_loras, control_vector=control_vector)
+
+                # Sample loop
+                while sample_idx < self.n_tokens:
+                    if self._abort_event.is_set():
                         return
-                tokens_or_none = yield token
-                tokens.clear()
-                tokens.append(token)
 
-                if tokens_or_none is not None:
-                    tokens.extend(tokens_or_none)
+                    token = self._sampling_ctx.sample(self._ctx, idx=-1)
+                    self._sampling_ctx.accept(token, False if grammar is None else True)
 
-                if sample_idx < self.n_tokens and token != self._input_ids[sample_idx]:
-                    self.n_tokens = sample_idx
-                    self._ctx.memory_seq_rm(0, self.n_tokens, -1)
-                    break
+                    sample_idx += 1
 
-            if self.draft_model is not None:
-                self.input_ids[self.n_tokens : self.n_tokens + len(tokens)] = tokens
-                draft_tokens = self.draft_model(
-                    self.input_ids[: self.n_tokens + len(tokens)]
-                )
-                tokens.extend(
-                    draft_tokens.astype(int)[
-                        : self._n_ctx - self.n_tokens - len(tokens)
-                    ]
+                    if stopping_criteria is not None:
+                        if stopping_criteria(
+                            self._input_ids[: sample_idx],
+                            self._scores[0 if not self._logits_all else sample_idx - self.n_tokens, :]
+                        ):
+                            return
+
+                    # Yield the generated token to the caller
+                    tokens_or_none = yield token
+
+                    tokens.clear()
+                    tokens.append(token)
+
+                    if tokens_or_none is not None:
+                        tokens.extend(tokens_or_none)
+
+                    # Rollback Check: A previously evaluated token (e.g. from speculative decoding)
+                    # mismatched the newly sampled token. We must rollback the KV cache.
+                    if sample_idx < self.n_tokens and token != self._input_ids[sample_idx]:
+                        self.n_tokens = sample_idx
+                        if self.is_hybrid:
+                            if self.verbose:
+                                print("Llama.generate: Draft token rejected for Hybrid model. Rolling back via Checkpoint.", file=sys.stderr)
+                            if self._hybrid_cache_mgr:
+                                best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(self._input_ids[:self.n_tokens].tolist(), 0)
+                                if best_ckpt and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
+                                    self.n_tokens = best_ckpt.pos
+                                else:
+                                    self._hybrid_cache_mgr.clear()
+                                    self._ctx.memory_clear(True)
+                                    self.n_tokens = 0
+                        else:
+                            if self.verbose:
+                                print(f"Llama.generate: Draft token rejected. Truncating context to {self.n_tokens}.", file=sys.stderr)
+                            self._ctx.memory_seq_rm(0, self.n_tokens, -1)
+
+                        break
+
+                # Speculative Decoding (Draft Model) logic
+                if self.draft_model is not None:
+                    if self.is_hybrid:
+                        if self.verbose:
+                            print("Llama.generate: Speculative decoding is skipped for Hybrid models.", file=sys.stderr)
+                    else:
+                        self.input_ids[self.n_tokens : self.n_tokens + len(tokens)] = tokens
+                        draft_tokens = self.draft_model(
+                            self.input_ids[: self.n_tokens + len(tokens)]
+                        )
+                        tokens.extend(
+                            draft_tokens.astype(int)[
+                                : self._n_ctx - self.n_tokens - len(tokens)
+                            ]
+                        )
+        finally:
+            # Ensure the final state is checkpointed for hybrid models when generation finishes or is interrupted
+            if (
+                self.is_hybrid
+                and self._hybrid_cache_mgr is not None
+                and self._hybrid_cache_mgr.max_checkpoints > 0
+            ):
+                current_history = self._input_ids[:self.n_tokens].tolist()
+
+                self._hybrid_cache_mgr.save_checkpoint(
+                    current_pos=self.n_tokens,
+                    tokens=current_history,
+                    seq_id=0
                 )
 
     def create_embedding(
@@ -1203,13 +1671,19 @@ class Llama:
         self,
         token_positions: Optional[List[int]] = None,
     ) -> Optional[np.ndarray]:
-        """Extract penultimate-layer hidden states (pre-final-block residual stream).
+        """Extract the residual stream after the final transformer block, before the final RMS norm.
 
-        These are the raw hidden states from the second-to-last transformer block,
-        before the final layer norm and LM head projection. This is the correct
-        conditioning signal for diffusion models that use LLM hidden states directly
-        (e.g. Lumina-2 style, zimage-turbo) as they were trained against this
-        representation, not the final post-norm output.
+        In HuggingFace transformers convention this is hidden_states[-2]:
+          - hidden_states[-1] = last_hidden_state (post final RMS norm, before lm_head)
+          - hidden_states[-2] = output of the last transformer block (attn + FFN + residual),
+                                 BEFORE the final RMS normalization
+
+        Note: this is NOT the output of the second-to-last transformer block. It is the
+        output of the LAST block (block n_layer-1), captured before build_norm() is applied.
+        In Qwen3/llama.cpp terms: cur after the transformer loop exits, before output_norm.
+
+        This is the correct conditioning signal for diffusion models trained on LLM hidden
+        states directly (e.g. Lumina-2, Z-Image) which use hidden_states[-2] as input.
 
         Requires:
             - embeddings=True set at model construction time
@@ -1376,7 +1850,7 @@ class Llama:
 
         # get pooling information
         pooling_type = self.pooling_type()
-        logits_all = pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE
+        logits_all = pooling_type == llama_cpp_lib.LLAMA_POOLING_TYPE_NONE
 
         if self.context_params.embeddings is False:
             raise RuntimeError(
@@ -1384,7 +1858,7 @@ class Llama:
             )
 
         if self.verbose:
-            llama_cpp.llama_perf_context_reset(self._ctx.ctx)
+            llama_cpp_lib.llama_perf_context_reset(self._ctx.ctx)
 
         if isinstance(input, str):
             inputs = [input]
@@ -1398,15 +1872,15 @@ class Llama:
         data: Union[List[List[float]], List[List[List[float]]]] = []
 
         def decode_batch(seq_sizes: List[int]):
-            llama_cpp.llama_memory_clear(llama_cpp.llama_get_memory(self._ctx.ctx), True)
+            llama_cpp_lib.llama_memory_clear(llama_cpp_lib.llama_get_memory(self._ctx.ctx), True)
             self._ctx.decode(self._batch)
             self._batch.reset()
 
             # store embeddings
-            if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE:
+            if pooling_type == llama_cpp_lib.LLAMA_POOLING_TYPE_NONE:
                 pos: int = 0
                 for i, size in enumerate(seq_sizes):
-                    ptr = llama_cpp.llama_get_embeddings(self._ctx.ctx)
+                    ptr = llama_cpp_lib.llama_get_embeddings(self._ctx.ctx)
                     embedding: List[List[float]] = [
                         ptr[pos + j * n_embd : pos + (j + 1) * n_embd]
                         for j in range(size)
@@ -1419,7 +1893,7 @@ class Llama:
                     pos += size
             else:
                 for i in range(len(seq_sizes)):
-                    ptr = llama_cpp.llama_get_embeddings_seq(self._ctx.ctx, i)
+                    ptr = llama_cpp_lib.llama_get_embeddings_seq(self._ctx.ctx, i)
                     embedding: List[float] = ptr[:n_embd]
                     if normalize:
                         embedding = internals.normalize_embedding(embedding)
@@ -1465,11 +1939,11 @@ class Llama:
         decode_batch(s_batch)
 
         if self.verbose:
-            llama_cpp.llama_perf_context_print(self._ctx.ctx)
+            llama_cpp_lib.llama_perf_context_print(self._ctx.ctx)
 
         output = data[0] if isinstance(input, str) else data
 
-        llama_cpp.llama_memory_clear(llama_cpp.llama_get_memory(self._ctx.ctx), True)
+        llama_cpp_lib.llama_memory_clear(llama_cpp_lib.llama_get_memory(self._ctx.ctx), True)
         self.reset()
 
         if return_count:
@@ -1499,7 +1973,6 @@ class Llama:
         dynatemp_exponent: float = 1.0,
         min_keep: int = 0,
         stream: bool = False,
-        seed: Optional[int] = None,
         mirostat_mode: int = 0,
         mirostat_tau: float = 5.0,
         mirostat_eta: float = 0.1,
@@ -1518,11 +1991,16 @@ class Llama:
         logit_bias: Optional[Dict[int, float]] = None,
         logits_processor: Optional[LogitsProcessorList] = None,
         grammar: Optional[LlamaGrammar] = None,
-        grammar_lazy: bool = False
+        grammar_lazy: bool = False,
+        seed: Optional[int] = None,
+        active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
+        control_vector: Optional[Dict[str, Any]] = None,
     ) -> Union[
         Iterator[CreateCompletionResponse], Iterator[CreateCompletionStreamResponse]
     ]:
         assert suffix is None or suffix.__class__ is str
+        # Each time a new request is initiated, the previous abort state must be cleared.
+        self._abort_event.clear()
 
         completion_id: str = f"cmpl-{str(uuid.uuid4())}"
         created: int = int(time.time())
@@ -1621,7 +2099,7 @@ class Llama:
 
         if len(prompt_tokens) >= self._n_ctx:
             raise ValueError(
-                f"Requested tokens ({len(prompt_tokens)}) exceed context window of {llama_cpp.llama_n_ctx(self.ctx)}"
+                f"Requested tokens ({len(prompt_tokens)}) exceed context window of {llama_cpp_lib.llama_n_ctx(self.ctx)}"
             )
 
         if max_tokens is None or max_tokens <= 0:
@@ -1649,10 +2127,10 @@ class Llama:
             try:
                 cache_item = self.cache[prompt_tokens]
                 cache_prefix_len = Llama.longest_token_prefix(
-                    cache_item.input_ids, prompt_tokens
+                    cache_item.input_ids, prompt_tokens, self.verbose
                 )
                 eval_prefix_len = Llama.longest_token_prefix(
-                    self._input_ids, prompt_tokens
+                    self._input_ids, prompt_tokens, self.verbose
                 )
                 if cache_prefix_len > eval_prefix_len:
                     self.load_state(cache_item)
@@ -1662,10 +2140,10 @@ class Llama:
                 if self.verbose:
                     print("Llama._create_completion: cache miss", file=sys.stderr)
 
-        if seed is not None:
-            self.set_seed(seed)
+        if stopping_criteria is None:
+            stopping_criteria = StoppingCriteriaList([AbortCriteria(self._abort_event)])
         else:
-            self.set_seed(random.Random(self._seed).randint(0, 2 ** 32))
+            stopping_criteria.append(AbortCriteria(self._abort_event))
 
         finish_reason = "length"
         multibyte_fix = 0
@@ -1702,10 +2180,18 @@ class Llama:
             logits_processor=logits_processor,
             grammar=grammar,
             grammar_lazy=grammar_lazy,
+            seed=seed if seed is not None else self._seed,
+            active_loras=active_loras,
+            control_vector=control_vector,
         ):
-            if llama_cpp.llama_token_is_eog(self._model.vocab, token):
+            if llama_cpp_lib.llama_token_is_eog(self._model.vocab, token):
                 text = self.detokenize(completion_tokens, prev_tokens=prompt_tokens)
                 finish_reason = "stop"
+                break
+
+            if self._abort_event.is_set():
+                text = self.detokenize(completion_tokens, prev_tokens=prompt_tokens)
+                finish_reason = "abort"
                 break
 
             completion_tokens.append(token)
@@ -1886,6 +2372,11 @@ class Llama:
         ):
             text = self.detokenize(completion_tokens, prev_tokens=prompt_tokens)
             finish_reason = "stop"
+
+        # If the abort is triggered externally, force the `finish_reason` to be changed to "abort".
+        if self._abort_event.is_set():
+            text = self.detokenize(completion_tokens, prev_tokens=prompt_tokens)
+            finish_reason = "abort"
 
         if self.verbose:
             self._ctx.print_timings()
@@ -2154,6 +2645,8 @@ class Llama:
         logits_processor: Optional[LogitsProcessorList] = None,
         grammar: Optional[LlamaGrammar] = None,
         grammar_lazy: bool = False,
+        active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
+        control_vector: Optional[Dict[str, Any]] = None,
     ) -> Union[CreateCompletionResponse, Iterator[CreateCompletionStreamResponse]]:
         """Generate text from a prompt.
 
@@ -2198,6 +2691,14 @@ prompt: The prompt to generate text from.
             logits_processor: A list of logits processors to use.
             grammar: A grammar to use for constrained sampling.
             grammar_lazy: If True, enables lazy evaluation.
+            active_loras: A list of dictionaries specifying the LoRA adapters to dynamically apply during generation.
+                Each dictionary must contain a "name" key (matching a LoRA previously loaded into VRAM via `load_lora()`)
+                and an optional "scale" key (float, defaults to 1.0).
+                Example: `[{"name": "role_A", "scale": 0.85}, {"name": "role_B", "scale": 0.5}]`.
+            control_vector: A dictionary containing Control Vector (CVec) data for representation engineering.
+                Must contain a "data" key with a flattened 1D list of floats.
+                Optionally accepts "layer_start" (int, defaults to 1) and "layer_end" (int, defaults to the model's total layer count).
+                Note: The length of the "data" list MUST be at least `n_embd * layer_end`, with zero-padding for any skipped early layers.
 
         Raises:
             ValueError: If the requested tokens exceed the context window.
@@ -2247,6 +2748,8 @@ prompt: The prompt to generate text from.
             logits_processor=logits_processor,
             grammar=grammar,
             grammar_lazy=grammar_lazy,
+            active_loras=active_loras,
+            control_vector=control_vector,
         )
         if stream:
             chunks: Iterator[CreateCompletionStreamResponse] = completion_or_chunks
@@ -2296,6 +2799,8 @@ prompt: The prompt to generate text from.
         logits_processor: Optional[LogitsProcessorList] = None,
         grammar: Optional[LlamaGrammar] = None,
         grammar_lazy: bool = False,
+        active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
+        control_vector: Optional[Dict[str, Any]] = None,
     ) -> Union[CreateCompletionResponse, Iterator[CreateCompletionStreamResponse]]:
         """Generate text from a prompt.
 
@@ -2340,6 +2845,14 @@ prompt: The prompt to generate text from.
             logits_processor: A list of logits processors to use.
             grammar: A grammar to use for constrained sampling.
             grammar_lazy: If True, enables lazy evaluation.
+            active_loras: A list of dictionaries specifying the LoRA adapters to dynamically apply during generation.
+                Each dictionary must contain a "name" key (matching a LoRA previously loaded into VRAM via `load_lora()`)
+                and an optional "scale" key (float, defaults to 1.0).
+                Example: `[{"name": "role_A", "scale": 0.85}, {"name": "role_B", "scale": 0.5}]`.
+            control_vector: A dictionary containing Control Vector (CVec) data for representation engineering.
+                Must contain a "data" key with a flattened 1D list of floats.
+                Optionally accepts "layer_start" (int, defaults to 1) and "layer_end" (int, defaults to the model's total layer count).
+                Note: The length of the "data" list MUST be at least `n_embd * layer_end`, with zero-padding for any skipped early layers.
 
         Raises:
             ValueError: If the requested tokens exceed the context window.
@@ -2389,6 +2902,8 @@ prompt: The prompt to generate text from.
             logits_processor=logits_processor,
             grammar=grammar,
             grammar_lazy=grammar_lazy,
+            active_loras=active_loras,
+            control_vector=control_vector,
         )
 
     def create_chat_completion(
@@ -2434,8 +2949,12 @@ prompt: The prompt to generate text from.
         logits_processor: Optional[LogitsProcessorList] = None,
         grammar: Optional[LlamaGrammar] = None,
         grammar_lazy: bool = False,
+        active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
+        control_vector: Optional[Dict[str, Any]] = None,
         logprobs: Optional[bool] = None,
         top_logprobs: Optional[int] = None,
+        assistant_prefill: bool = False,
+        add_generation_prompt: bool = True,
     ) -> Union[
         CreateChatCompletionResponse, Iterator[CreateChatCompletionStreamResponse]
     ]:
@@ -2483,6 +3002,14 @@ prompt: The prompt to generate text from.
             logits_processor: A list of logits processors to use.
             grammar: A grammar to use.
             grammar_lazy: If True, enables lazy evaluation.
+            active_loras: A list of dictionaries specifying the LoRA adapters to dynamically apply during generation.
+                Each dictionary must contain a "name" key (matching a LoRA previously loaded into VRAM via `load_lora()`)
+                and an optional "scale" key (float, defaults to 1.0).
+                Example: `[{"name": "role_A", "scale": 0.85}, {"name": "role_B", "scale": 0.5}]`.
+            control_vector: A dictionary containing Control Vector (CVec) data for representation engineering.
+                Must contain a "data" key with a flattened 1D list of floats.
+                Optionally accepts "layer_start" (int, defaults to 1) and "layer_end" (int, defaults to the model's total layer count).
+                Note: The length of the "data" list MUST be at least `n_embd * layer_end`, with zero-padding for any skipped early layers.
 
         Returns:
             Generated chat completion or a stream of chat completion chunks.
@@ -2537,6 +3064,10 @@ prompt: The prompt to generate text from.
             logits_processor=logits_processor,
             grammar=grammar,
             grammar_lazy=grammar_lazy,
+            active_loras=active_loras,
+            control_vector=control_vector,
+            assistant_prefill=assistant_prefill,
+            add_generation_prompt=add_generation_prompt,
         )
 
     def create_chat_completion_openai_v1(
@@ -2577,6 +3108,8 @@ prompt: The prompt to generate text from.
             model_path=self.model_path,
             # Model Params
             n_gpu_layers=self.model_params.n_gpu_layers,
+            cpu_moe=self.cpu_moe,
+            n_cpu_moe=self.n_cpu_moe,
             split_mode=self.model_params.split_mode,
             main_gpu=self.model_params.main_gpu,
             tensor_split=self.tensor_split,
@@ -2587,6 +3120,7 @@ prompt: The prompt to generate text from.
             check_tensors=self.model_params.check_tensors,
             use_extra_bufts=self.model_params.use_extra_bufts,
             no_host=self.model_params.no_host,
+            skip_output_head=self.model_params.skip_output_head,
             kv_overrides=self.kv_overrides,
             # Context Params
             seed=self._seed,
@@ -2615,10 +3149,6 @@ prompt: The prompt to generate text from.
             # Sampling Params
             no_perf=self.context_params.no_perf,
             last_n_tokens_size=self.last_n_tokens_size,
-            # LoRA Params
-            lora_base=self.lora_base,
-            lora_scale=self.lora_scale,
-            lora_path=self.lora_path,
             # Backend Params
             numa=self.numa,
             # Chat Format Params
@@ -2642,7 +3172,7 @@ prompt: The prompt to generate text from.
             print("Llama.save_state: saving llama state", file=sys.stderr)
 
         # Query the backend for the required buffer size to store the current state.
-        state_size = llama_cpp.llama_state_get_size(self._ctx.ctx)
+        state_size = llama_cpp_lib.llama_state_get_size(self._ctx.ctx)
         if self.verbose:
             print(f"Llama.save_state: got state size: {state_size}", file=sys.stderr)
 
@@ -2653,7 +3183,7 @@ prompt: The prompt to generate text from.
 
         # Copy the raw state data from the internal C context into our Python-managed buffer.
         # Returns the actual number of bytes written (n_bytes).
-        n_bytes = llama_cpp.llama_state_get_data(self._ctx.ctx, llama_state, state_size)
+        n_bytes = llama_cpp_lib.llama_state_get_data(self._ctx.ctx, llama_state, state_size)
         if self.verbose:
             print(f"Llama.save_state: copied llama state: {n_bytes}", file=sys.stderr)
 
@@ -2705,7 +3235,7 @@ prompt: The prompt to generate text from.
         # Copy the raw bytes from the Python object into a C-compatible buffer.
         llama_state = LLamaStateArrayType.from_buffer_copy(state.llama_state)
 
-        if llama_cpp.llama_state_set_data(self._ctx.ctx, llama_state, state_size) != state_size:
+        if llama_cpp_lib.llama_state_set_data(self._ctx.ctx, llama_state, state_size) != state_size:
             raise RuntimeError("Failed to set llama state data")
 
     def n_ctx(self) -> int:
@@ -2809,7 +3339,8 @@ prompt: The prompt to generate text from.
     @staticmethod
     def longest_token_prefix(
         current_ids: Union[Sequence[int], npt.NDArray[np.intc]],
-        new_tokens: Union[Sequence[int], npt.NDArray[np.intc]]
+        new_tokens: Union[Sequence[int], npt.NDArray[np.intc]],
+        verbose: bool = False
     ) -> int:
         """
         Calculates the length of the longest common prefix between two token sequences.
@@ -2821,12 +3352,19 @@ prompt: The prompt to generate text from.
         Args:
             current_ids: The existing token sequence (e.g., KV cache).
             new_tokens: The new input token sequence.
+            verbose: If True, prints detailed debug information to stderr.
 
         Returns:
             int: The number of matching tokens from the start.
         """
         # Fast exit for empty sequences to avoid unnecessary processing
         if len(current_ids) == 0 or len(new_tokens) == 0:
+            if verbose:
+                print(
+                    f"Llama.longest_token_prefix [Fast Exit 1]: Empty sequence detected. "
+                    f"len(current_ids)={len(current_ids)}, len(new_tokens)={len(new_tokens)}",
+                    file=sys.stderr
+                )
             return 0
 
         # Determine the comparison range (limited by the shorter sequence)
@@ -2835,6 +3373,12 @@ prompt: The prompt to generate text from.
         # Probe inspection: Use Python to quickly compare the first token
         # If the tokens are different from the beginning, return immediately to avoid any NumPy overhead.
         if current_ids[0] != new_tokens[0]:
+            if verbose:
+                print(
+                    f"Llama.longest_token_prefix [Fast Exit 2]: First token mismatch. "
+                    f"current_ids[0]={current_ids[0]} vs new_tokens[0]={new_tokens[0]}",
+                    file=sys.stderr
+                )
             return 0
 
         # Accelerating SIMD for Large Data Volumes
@@ -2872,8 +3416,8 @@ prompt: The prompt to generate text from.
         **kwargs: Any,
     ) -> "Llama":
         """Create a Llama model from a pretrained model name or path.
-        This method requires the huggingface-hub package.
-        You can install it with `pip install huggingface-hub`.
+        This method requires the huggingface_hub package.
+        You can install it with `pip install --upgrade huggingface_hub`.
 
         Args:
             repo_id: The model repo id.
@@ -2891,7 +3435,7 @@ prompt: The prompt to generate text from.
         except ImportError:
             raise ImportError(
                 "Llama.from_pretrained requires the huggingface-hub package. "
-                "You can install it with `pip install huggingface-hub`."
+                "You can install it with `pip install --upgrade huggingface_hub`."
             )
 
         validate_repo_id(repo_id)
